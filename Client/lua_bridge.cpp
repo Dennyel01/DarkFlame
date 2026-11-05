@@ -1,0 +1,2901 @@
+#include "lua_bridge.h"
+
+#include "embedded_lua_loader.h"
+#include "embedded_lua_runtime.h"
+#include "gui.h"
+#include "input_utils.h"
+#include "logger.h"
+#include "lua_bridge_bootstrap.h"
+#include "lua_bridge_signatures.h"
+#include "lua_bridge_utils.h"
+#include "memory_utils.h"
+#include "netc_hooks.h"
+#include "pilot_telemetry.h"
+#include "plow_bot.h"
+#include "resource.h"
+#include "signature_scanner.h"
+
+#include <MinHook.h>
+#include <mmsystem.h>
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <charconv>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <iterator>
+#include <mutex>
+#include <string>
+#include <string_view>
+#include <thread>
+#include <vector>
+
+#pragma comment(lib, "winmm.lib")
+
+namespace
+{
+using namespace LuaBridgeSignatures;
+using namespace LuaBridgeUtil;
+using namespace MemoryUtil;
+using namespace InputUtil;
+
+constexpr int LuaRegistryIndex = -10000;
+constexpr int LuaGlobalsIndex = -10002;
+
+using LuaCFunction = int(__cdecl*)(void*);
+using LuaNewThreadFn = void*(__cdecl*)(void*);
+using GetVirtualMachineFn = void*(__thiscall*)(void*, void*);
+using OnPreFunctionFn = bool(__thiscall*)(void*, LuaCFunction, void*, bool);
+using CallHookFn = bool(__stdcall*)(const char*, const void*, const void*, bool);
+using AddDebugHookFn = bool(__thiscall*)(void*, int, const void*, const void*);
+using RemoveDebugHookFn = bool(__thiscall*)(void*, int, const void*);
+using LuaMToRefFn = void*(__cdecl*)(void*, void*, int);
+using LuaFunctionRefDtorFn = void(__thiscall*)(void*);
+
+std::atomic_bool g_ready{};
+std::atomic_bool g_hideCalls{};
+std::atomic_uint32_t g_scopeDepth{};
+std::atomic_bool g_monitorReady{};
+std::atomic_bool g_eventLogged{};
+std::atomic_uint32_t g_hideTransitions{};
+std::atomic_uint32_t g_scopeTransitions{};
+std::atomic_uint32_t g_bootstrapState{};
+std::atomic<void*> g_bootstrapLua{};
+std::atomic<void*> g_bootstrapMain{};
+std::atomic<DWORD> g_reconnectCheckTick{};
+std::atomic<DWORD> g_runtimePulseTick{};
+std::atomic_uint32_t g_tramState{};
+std::atomic_uintptr_t g_tramSession{};
+std::atomic<DWORD> g_tramRetryTick{};
+std::atomic_bool g_tramUiReadyLogged{};
+std::atomic_uint32_t g_jbkState{};
+std::atomic_uintptr_t g_jbkSession{};
+std::atomic<DWORD> g_jbkRetryTick{};
+std::atomic_bool g_jbkUiReadyLogged{};
+std::atomic_uint32_t g_pilotState{};
+std::atomic_uintptr_t g_pilotSession{};
+std::atomic<DWORD> g_pilotRetryTick{};
+std::atomic_uint32_t g_plowState{};
+std::atomic_uintptr_t g_plowSession{};
+std::atomic<DWORD> g_plowRetryTick{};
+ULONGLONG g_plowFileTime{};
+ULONGLONG g_plowFileSize{};
+ULONGLONG g_plowSeenTime{};
+ULONGLONG g_plowSeenSize{};
+DWORD g_plowSeenTick{};
+DWORD g_plowWatchTick{};
+DWORD g_plowAliveTick{};
+std::string g_plowNext;
+std::string g_plowStatusError;
+std::atomic_bool g_plowUserUnloaded{};
+std::atomic_uint32_t g_alertMonitorSources{};
+std::atomic_uint32_t g_keyEmulationLogs{};
+std::atomic<DWORD> g_unknownKeyLogTick{};
+HMODULE g_clientModule{};
+std::array<std::array<unsigned char, 8>, 3> g_hookPatches{};
+std::array<bool, 3> g_hookPatchValid{};
+std::mutex g_installMutex;
+std::wstring g_tramScriptPath;
+std::wstring g_jbkScriptPath;
+std::wstring g_pilotScriptPath;
+std::wstring g_plowScriptPath;
+std::string g_bootstrapPayload;
+std::string g_bootstrapError;
+std::string g_tramPayload;
+std::string g_jbkPayload;
+std::string g_pilotPayload;
+std::string g_plowPayload;
+void* g_onPreFunctionTarget{};
+void* g_callHookTarget{};
+void* g_triggerServerEventTarget{};
+OnPreFunctionFn g_onPreFunction{};
+CallHookFn g_callHook{};
+LuaCFunction g_triggerServerEvent{};
+LuaCFunction g_triggerEvent{};
+LuaCFunction g_addEvent{};
+LuaCFunction g_addEventHandler{};
+LuaCFunction g_removeEventHandler{};
+GetVirtualMachineFn g_getVirtualMachine{};
+bool g_hardenedLuaManager{};
+void** g_luaManagerSlot{};
+void** g_clientGameSlot{};
+std::size_t g_debugHookManagerOffset{};
+LuaNewThreadFn g_luaNewThread{};
+AddDebugHookFn g_addDebugHook{};
+RemoveDebugHookFn g_removeDebugHook{};
+LuaMToRefFn g_luaMToRef{};
+LuaFunctionRefDtorFn g_luaFunctionRefDtor{};
+
+struct LuaSession
+{
+    std::uintptr_t id;
+    void* owner;
+    void* main;
+    void* thread;
+    int reference;
+    std::string resource;
+};
+
+std::vector<LuaSession> g_sessions;
+
+struct EventCatcher
+{
+    std::uint32_t id;
+    void* owner;
+    void* main;
+    std::string name;
+    int reference;
+    int skip;
+};
+
+std::mutex g_catcherMutex;
+std::vector<EventCatcher> g_eventCatchers;
+std::atomic_uint32_t g_nextCatcher{1};
+thread_local bool g_dispatchingCatchers{};
+
+bool HiddenActive()
+{
+    return g_hideCalls.load(std::memory_order_acquire)
+        || g_scopeDepth.load(std::memory_order_acquire) != 0;
+}
+
+bool MonitorName(std::string_view name)
+{
+    return name == "triggerServerEvent"
+        || name == "triggerLatentServerEvent";
+}
+
+std::string LuaText(void* lua, int index, std::size_t limit = 384,
+    bool flatten = true)
+{
+    std::size_t length{};
+    const char* text = DarkFlameLuaToLString(lua, index, &length);
+    if(!text)
+        return "<value>";
+    const std::size_t copied = std::min(length, limit);
+    std::string output(text, copied);
+    for(char& value : output)
+    {
+        if(flatten && (value == '\r' || value == '\n' || value == '\t'))
+            value = ' ';
+    }
+    if(copied != length)
+        output += "...";
+    return output;
+}
+
+bool InjectIntoResource(std::string_view resource, std::string_view code,
+    std::uintptr_t& id, std::string& error);
+bool InjectFromInjector(std::string_view resource, std::string_view code,
+    std::uintptr_t& id, std::string& error);
+void DrainThreadRequests();
+bool LuaIdentity(void* lua, void*& owner, void*& state);
+bool LuaStateAlive(void* state, void* owner = nullptr);
+std::string CurrentLuaResource(void* lua);
+int __cdecl DirectTriggerServerEvent(void* lua);
+int __cdecl DirectSyncEvent(void* lua);
+int __cdecl DirectSelfLink(void* lua);
+int __cdecl DirectTriggerEvent(void* lua);
+int __cdecl DirectAddEvent(void* lua);
+int __cdecl DirectAddEventHandler(void* lua);
+int __cdecl DirectRemoveEventHandler(void* lua);
+int __cdecl DirectAddDebugHook(void* lua);
+int __cdecl DirectRemoveDebugHook(void* lua);
+int __cdecl DirectEmulateKey(void* lua);
+int __cdecl DirectEmulateMouseButton(void* lua);
+int __cdecl DirectPlayAlertSignal(void* lua);
+int __cdecl DirectSetAlertMonitorEnabled(void* lua);
+int __cdecl DirectCatchServerEvent(void* lua);
+int __cdecl DirectRemoveEventCatcher(void* lua);
+int __cdecl DirectTramTakeCommand(void* lua);
+int __cdecl DirectTramUpdate(void* lua);
+int __cdecl DirectTramLog(void* lua);
+int __cdecl DirectJbkTakeCommand(void* lua);
+int __cdecl DirectJbkUpdate(void* lua);
+int PushDirectResult(void* lua, bool result);
+void DispatchEventCatchers(void* lua);
+
+void RegisterPrivate(void* lua, const char* name, LuaCFunction function)
+{
+    DarkFlameLuaRegister(lua, name, function);
+}
+
+int __cdecl HideFunctionCall(void* lua)
+{
+    const bool hidden = DarkFlameLuaToBoolean(lua, 1) != 0;
+    g_hideCalls.store(hidden, std::memory_order_release);
+    if(g_hideTransitions.fetch_add(1, std::memory_order_relaxed) < 12)
+        Log::Write(hidden ? L"[lua-bridge] hide filter enabled"
+            : L"[lua-bridge] hide filter disabled");
+    DarkFlameLuaPushBoolean(lua, 1);
+    return 1;
+}
+
+int __cdecl HideActive(void* lua)
+{
+    DarkFlameLuaPushBoolean(lua, HiddenActive() ? 1 : 0);
+    return 1;
+}
+
+int __cdecl TraceHidden(void* lua)
+{
+    const bool hidden = HiddenActive();
+    const bool flag = g_hideCalls.load(std::memory_order_acquire);
+    const auto depth = g_scopeDepth.load(std::memory_order_acquire);
+    try
+    {
+        Log::Write(L"[hidden-trace] entry=" + WideAscii(LuaText(lua, 1, 96))
+            + L" HiddenActive=" + std::to_wstring(hidden)
+            + L" g_hideCalls=" + std::to_wstring(flag)
+            + L" scopeDepth=" + std::to_wstring(depth)
+            + L" lua=" + std::to_wstring(reinterpret_cast<std::uintptr_t>(lua)));
+    }
+    catch(...)
+    {
+    }
+    return 0;
+}
+
+int __cdecl TrapScope(void* lua)
+{
+    const bool enter = DarkFlameLuaToBoolean(lua, 1) != 0;
+    std::uint32_t depth{};
+    if(enter)
+    {
+        depth = g_scopeDepth.fetch_add(1, std::memory_order_acq_rel) + 1;
+    }
+    else
+    {
+        depth = g_scopeDepth.load(std::memory_order_acquire);
+        while(depth && !g_scopeDepth.compare_exchange_weak(depth, depth - 1,
+            std::memory_order_acq_rel, std::memory_order_acquire))
+        {
+        }
+        if(depth)
+            --depth;
+    }
+    if(g_scopeTransitions.fetch_add(1, std::memory_order_relaxed) < 12)
+    {
+        Log::Write(std::wstring(L"[lua-bridge] trap scope ")
+            + (enter ? L"enter, depth=" : L"leave, depth=")
+            + std::to_wstring(depth));
+    }
+    DarkFlameLuaPushBoolean(lua, 1);
+    return 1;
+}
+
+int __cdecl TakeLuaCode(void* lua)
+{
+    DrainThreadRequests();
+    std::string code;
+    std::string resource;
+    if(!GuiTakeLuaCode(code, resource))
+        return 0;
+    DarkFlameLuaPushString(lua, code.c_str());
+    DarkFlameLuaPushString(lua, resource.c_str());
+    return 2;
+}
+
+int __cdecl InjectResource(void* lua)
+{
+    const std::string resource = LuaText(lua, 1, 128);
+    const std::string code = LuaText(lua, 2, 1024 * 1024, false);
+    std::uintptr_t id{};
+    std::string error;
+    const bool injected = InjectFromInjector(resource, code, id, error);
+    DarkFlameLuaPushBoolean(lua, injected ? 1 : 0);
+    if(injected)
+    {
+        char text[24]{};
+        std::snprintf(text, sizeof(text), "0x%08lX",
+            static_cast<unsigned long>(id));
+        DarkFlameLuaPushString(lua, text);
+    }
+    else
+        DarkFlameLuaPushString(lua, error.c_str());
+    return 2;
+}
+
+int __cdecl MenuOpen(void* lua)
+{
+    DarkFlameLuaPushBoolean(lua, GuiVisible() ? 1 : 0);
+    return 1;
+}
+
+int __cdecl EmitEvent(void* lua)
+{
+    const int top = std::clamp(DarkFlameLuaGetTop(lua), 0, 16);
+    if(!top)
+        return 0;
+
+    if(LuaText(lua, 1) != "event")
+        return 0;
+    GuiAppendEvent(top >= 2 ? LuaText(lua, 2, 8192, false)
+        : "[event] invalid callback payload");
+    if(!g_eventLogged.exchange(true))
+        Log::Write(L"[lua-bridge] first event callback reached");
+    return 0;
+}
+
+int __cdecl DirectTramTakeCommand(void* lua)
+{
+    std::string command;
+    if(!GuiTakeTramCommand(command))
+        return 0;
+    DarkFlameLuaPushString(lua, command.c_str());
+    Log::Write(L"[trambot] Lua consumed GUI command: " + WideAscii(command));
+    return 1;
+}
+
+int __cdecl DirectTramUpdate(void* lua)
+{
+    if(DarkFlameLuaGetTop(lua) < 2)
+    {
+        DarkFlameLuaPushBoolean(lua, 0);
+        return 1;
+    }
+    const std::string key = LuaText(lua, 1, 64, false);
+    const std::string value = LuaText(lua, 2, 512, false);
+    GuiUpdateTramState(key, value);
+    if(key == "loaded")
+    {
+        const bool loaded = value == "1" || value == "true";
+        if(loaded && !g_tramUiReadyLogged.exchange(true))
+            Log::Write(L"[trambot] Lua GUI bridge online");
+        else if(!loaded)
+            g_tramUiReadyLogged.store(false, std::memory_order_release);
+    }
+    DarkFlameLuaPushBoolean(lua, 1);
+    return 1;
+}
+
+int __cdecl DirectTramLog(void* lua)
+{
+    if(DarkFlameLuaGetTop(lua) < 1)
+        return PushDirectResult(lua, false);
+    const std::string text = LuaText(lua, 1, 8192, false);
+    if(text.empty())
+        return PushDirectResult(lua, false);
+    Log::Tram(text);
+    return PushDirectResult(lua, true);
+}
+
+int __cdecl DirectJbkTakeCommand(void* lua)
+{
+    std::string command;
+    if(!GuiTakeJbkCommand(command))
+        return 0;
+    DarkFlameLuaPushString(lua, command.c_str());
+    Log::Write(L"[jbkbot] Lua consumed GUI command: " + WideAscii(command));
+    return 1;
+}
+
+int __cdecl DirectJbkUpdate(void* lua)
+{
+    if(DarkFlameLuaGetTop(lua) < 2)
+    {
+        DarkFlameLuaPushBoolean(lua, 0);
+        return 1;
+    }
+    const std::string key = LuaText(lua, 1, 64, false);
+    const std::string value = LuaText(lua, 2, 512, false);
+    GuiUpdateJbkState(key, value);
+    if(key == "loaded")
+    {
+        const bool loaded = value == "1" || value == "true";
+        if(loaded && !g_jbkUiReadyLogged.exchange(true))
+            Log::Write(L"[jbkbot] Lua GUI bridge online");
+        else if(!loaded)
+            g_jbkUiReadyLogged.store(false, std::memory_order_release);
+    }
+    DarkFlameLuaPushBoolean(lua, 1);
+    return 1;
+}
+
+void RegisterDirectAliases(void* lua)
+{
+    RegisterPilotTelemetryLua(lua);
+    RegisterPlowBotLua(lua);
+    RegisterPrivate(lua, "dfTriggerServerEvent", &DirectTriggerServerEvent);
+    RegisterPrivate(lua, "dfSyncEvent", &DirectSyncEvent);
+    RegisterPrivate(lua, "dfSelfLink", &DirectSelfLink);
+    RegisterPrivate(lua, "dfTriggerEvent", &DirectTriggerEvent);
+    RegisterPrivate(lua, "dfAddEvent", &DirectAddEvent);
+    RegisterPrivate(lua, "dfAddEventHandler", &DirectAddEventHandler);
+    RegisterPrivate(lua, "dfRemoveEventHandler", &DirectRemoveEventHandler);
+    RegisterPrivate(lua, "dfAddDebugHook", &DirectAddDebugHook);
+    RegisterPrivate(lua, "dfRemoveDebugHook", &DirectRemoveDebugHook);
+    RegisterPrivate(lua, "dfEmulateKey", &DirectEmulateKey);
+    RegisterPrivate(lua, "dfEmulateMouseButton", &DirectEmulateMouseButton);
+    RegisterPrivate(lua, "dfPlayAlertSignal", &DirectPlayAlertSignal);
+    RegisterPrivate(lua, "dfSetAlertMonitorEnabled", &DirectSetAlertMonitorEnabled);
+    RegisterPrivate(lua, "dfCatchServerEvent", &DirectCatchServerEvent);
+    RegisterPrivate(lua, "dfRemoveEventCatcher", &DirectRemoveEventCatcher);
+    RegisterPrivate(lua, "dfTramTakeCommand", &DirectTramTakeCommand);
+    RegisterPrivate(lua, "dfTramUpdate", &DirectTramUpdate);
+    RegisterPrivate(lua, "dfTramLog", &DirectTramLog);
+    RegisterPrivate(lua, "dfJbkTakeCommand", &DirectJbkTakeCommand);
+    RegisterPrivate(lua, "dfJbkUpdate", &DirectJbkUpdate);
+    RegisterPrivate(lua, "dfMenuOpen", &MenuOpen);
+    RegisterPrivate(lua, "dfTraceHidden", &TraceHidden);
+}
+
+void RegisterBridge(void* lua)
+{
+    RegisterDirectAliases(lua);
+    RegisterPrivate(lua, "hideFunctionCall", &HideFunctionCall);
+    RegisterPrivate(lua, "dfTrapScope", &TrapScope);
+    RegisterPrivate(lua, "dfHideActive", &HideActive);
+    RegisterPrivate(lua, "dfTake", &TakeLuaCode);
+    RegisterPrivate(lua, "dfInject", &InjectResource);
+    RegisterPrivate(lua, "dfEmit", &EmitEvent);
+}
+
+struct LuaArgumentsView
+{
+    std::uintptr_t begin;
+    std::uintptr_t end;
+    std::uintptr_t capacity;
+};
+
+struct LuaFunctionRefStorage
+{
+    alignas(void*) std::byte bytes[24];
+};
+
+static_assert(sizeof(LuaFunctionRefStorage) == 24);
+static_assert(sizeof(std::string) == 24);
+
+bool DebugHookType(void* lua, int& hookType)
+{
+    if(DarkFlameLuaType(lua, 1) != 4)
+        return false;
+    const std::string name = LuaText(lua, 1, 32);
+    constexpr std::string_view names[] = {
+        "preEvent", "postEvent", "preFunction", "postFunction",
+        "preEventFunction", "postEventFunction"
+    };
+    const auto found = std::find(std::begin(names), std::end(names), name);
+    if(found == std::end(names))
+        return false;
+    hookType = static_cast<int>(found - std::begin(names));
+    return true;
+}
+
+bool AllowedDebugHookNames(void* lua, std::vector<std::string>& names)
+{
+    const int top = DarkFlameLuaGetTop(lua);
+    if(top < 3 || DarkFlameLuaType(lua, 3) == 0)
+        return true;
+    if(DarkFlameLuaType(lua, 3) != 5)
+        return false;
+
+    DarkFlameLuaPushNil(lua);
+    while(DarkFlameLuaNext(lua, 3))
+    {
+        if(names.size() >= 1024 || DarkFlameLuaType(lua, -1) != 4)
+        {
+            DarkFlameLuaSetTop(lua, top);
+            return false;
+        }
+        std::size_t length{};
+        const char* value = DarkFlameLuaToLString(lua, -1, &length);
+        if(!value || length > 1024)
+        {
+            DarkFlameLuaSetTop(lua, top);
+            return false;
+        }
+        names.emplace_back(value, length);
+        DarkFlameLuaSetTop(lua, -2);
+    }
+    return true;
+}
+
+void* DebugHookManager()
+{
+    void* game{};
+    void* manager{};
+    if(!g_clientGameSlot || !ReadValue(g_clientGameSlot, 0, game) || !game
+        || !g_debugHookManagerOffset
+        || !ReadValue(game, g_debugHookManagerOffset, manager))
+    {
+        return nullptr;
+    }
+    return manager;
+}
+
+int PushDirectResult(void* lua, bool result)
+{
+    DarkFlameLuaPushBoolean(lua, result ? 1 : 0);
+    return 1;
+}
+
+int __cdecl DirectTriggerServerEvent(void* lua)
+{
+    if(!g_triggerServerEvent)
+        return PushDirectResult(lua, false);
+    DispatchEventCatchers(lua);
+    SetNetcLuaCallContext(CurrentLuaResource(lua));
+    const int result = g_triggerServerEvent(lua);
+    ClearNetcLuaCallContext();
+    return result;
+}
+
+int __cdecl DirectSyncEvent(void* lua)
+{
+    const int top = DarkFlameLuaGetTop(lua);
+    const int sourceType = top >= 5 ? DarkFlameLuaType(lua, 5) : -1;
+    Log::Write(L"[lua-bridge] dfSyncEvent entered: argc="
+        + std::to_wstring(top) + L" source-type="
+        + std::to_wstring(sourceType));
+    if(!g_triggerServerEvent || top < 5
+        || !DarkFlameLuaIsNumber(lua, 1)
+        || !DarkFlameLuaIsNumber(lua, 2)
+        || !DarkFlameLuaIsNumber(lua, 3)
+        || DarkFlameLuaType(lua, 4) != 4
+        || (sourceType != 2 && sourceType != 7))
+    {
+        Log::Write(L"[lua-bridge] dfSyncEvent rejected: bad arguments or "
+            L"TriggerServerEvent is unavailable");
+        return PushDirectResult(lua, false);
+    }
+
+    const float x = static_cast<float>(DarkFlameLuaToNumber(lua, 1));
+    const float y = static_cast<float>(DarkFlameLuaToNumber(lua, 2));
+    const float z = static_cast<float>(DarkFlameLuaToNumber(lua, 3));
+    if(!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)
+        || x < -8192.0f || x > 8191.0f
+        || y < -8192.0f || y > 8191.0f
+        || z <= -100000.0f || z >= 100000.0f)
+    {
+        Log::Write(L"[lua-bridge] dfSyncEvent rejected: position is outside "
+            L"the supported sync range");
+        return PushDirectResult(lua, false);
+    }
+
+    float oldX{};
+    float oldY{};
+    float oldZ{};
+    if(!ReadLocalPlayerPosition(oldX, oldY, oldZ))
+    {
+        Log::Write(L"[lua-bridge] dfSyncEvent rejected: current player "
+            L"position is unavailable");
+        return PushDirectResult(lua, false);
+    }
+
+    DarkFlameLuaRemove(lua, 1);
+    DarkFlameLuaRemove(lua, 1);
+    DarkFlameLuaRemove(lua, 1);
+    const int eventArguments = DarkFlameLuaGetTop(lua);
+
+    BeginPlayerPureSyncSuppression();
+    const bool sentNew = SendReliablePlayerPureSync(x, y, z);
+    int callResult = 1;
+    bool callSucceeded{};
+    bool eventAccepted{};
+    if(sentNew)
+    {
+        DarkFlameLuaPushCFunction(lua, &DirectTriggerServerEvent);
+        DarkFlameLuaInsert(lua, 1);
+        callResult = DarkFlameLuaPCall(lua, eventArguments, -1, 0);
+        callSucceeded = callResult == 0;
+        eventAccepted = callSucceeded && DarkFlameLuaGetTop(lua) > 0
+            && DarkFlameLuaToBoolean(lua, -1) != 0;
+        if(!callSucceeded)
+        {
+            Log::Write(L"[lua-bridge] dfSyncEvent server event failed: "
+                + WideAscii(LuaText(lua, -1, 1024, false)));
+        }
+    }
+    const bool sentOld = sentNew
+        && SendReliablePlayerPureSync(oldX, oldY, oldZ);
+    EndPlayerPureSyncSuppression();
+
+    Log::Write(L"[lua-bridge] dfSyncEvent stages: new="
+        + std::to_wstring(sentNew ? 1 : 0) + L" event-call="
+        + std::to_wstring(callSucceeded ? 1 : 0) + L" event-result="
+        + std::to_wstring(eventAccepted ? 1 : 0) + L" old="
+        + std::to_wstring(sentOld ? 1 : 0));
+
+    if(!sentNew || !callSucceeded || !eventAccepted || !sentOld)
+    {
+        DarkFlameLuaSetTop(lua, 0);
+        return PushDirectResult(lua, false);
+    }
+    DarkFlameLuaSetTop(lua, 0);
+    return PushDirectResult(lua, true);
+}
+
+bool CurrentVehicleElementId(void* lua, unsigned int& id,
+    std::wstring& failure)
+{
+    const int top = DarkFlameLuaGetTop(lua);
+    DarkFlameLuaGetField(lua, LuaGlobalsIndex, "getPedOccupiedVehicle");
+    DarkFlameLuaGetField(lua, LuaGlobalsIndex, "localPlayer");
+    const int functionType = DarkFlameLuaType(lua, -2);
+    const int playerType = DarkFlameLuaType(lua, -1);
+    if(functionType != 6)
+    {
+        failure = L"getPedOccupiedVehicle is unavailable; type="
+            + std::to_wstring(functionType);
+        DarkFlameLuaSetTop(lua, top);
+        return false;
+    }
+    if(playerType != 2 && playerType != 7)
+    {
+        failure = L"localPlayer is unavailable; type="
+            + std::to_wstring(playerType);
+        DarkFlameLuaSetTop(lua, top);
+        return false;
+    }
+    const int callResult = DarkFlameLuaPCall(lua, 1, 1, 0);
+    if(callResult != 0)
+    {
+        failure = L"getPedOccupiedVehicle failed; pcall="
+            + std::to_wstring(callResult) + L" error="
+            + WideAscii(LuaText(lua, -1, 512, false));
+        DarkFlameLuaSetTop(lua, top);
+        return false;
+    }
+
+    const int type = DarkFlameLuaType(lua, -1);
+    if(type != 2 && type != 7)
+    {
+        failure = L"getPedOccupiedVehicle returned no element; type="
+            + std::to_wstring(type);
+        DarkFlameLuaSetTop(lua, top);
+        return false;
+    }
+    void* value = DarkFlameLuaToUserData(lua, -1);
+    if(type == 7)
+    {
+        void* wrapped{};
+        if(!value || !ReadValue(value, 0, wrapped))
+        {
+            failure = L"vehicle userdata unwrap failed";
+            DarkFlameLuaSetTop(lua, top);
+            return false;
+        }
+        value = wrapped;
+    }
+    const std::uintptr_t raw = reinterpret_cast<std::uintptr_t>(value);
+    DarkFlameLuaSetTop(lua, top);
+    if(raw >= (1u << 17))
+    {
+        failure = L"vehicle element ID does not fit 17 bits; id="
+            + std::to_wstring(raw);
+        return false;
+    }
+    id = static_cast<unsigned int>(raw);
+    return true;
+}
+
+int __cdecl DirectSelfLink(void* lua)
+{
+    Log::Write(L"[lua-bridge] dfSelfLink entered: argc="
+        + std::to_wstring(DarkFlameLuaGetTop(lua)));
+    unsigned int vehicleId{};
+    std::wstring failure;
+    if(!CurrentVehicleElementId(lua, vehicleId, failure))
+    {
+        Log::Write(L"[lua-bridge] dfSelfLink return=false: " + failure);
+        return PushDirectResult(lua, false);
+    }
+    Log::Write(L"[lua-bridge] dfSelfLink vehicle-id="
+        + std::to_wstring(vehicleId));
+    const bool result = SendVehicleSelfLink(vehicleId);
+    Log::Write(result ? L"[lua-bridge] dfSelfLink return=true"
+        : L"[lua-bridge] dfSelfLink return=false: packet send failed");
+    return PushDirectResult(lua, result);
+}
+
+int __cdecl DirectAddEvent(void* lua)
+{
+    return g_addEvent ? g_addEvent(lua) : PushDirectResult(lua, false);
+}
+
+int __cdecl DirectTriggerEvent(void* lua)
+{
+    return g_triggerEvent ? g_triggerEvent(lua) : PushDirectResult(lua, false);
+}
+
+int __cdecl DirectAddEventHandler(void* lua)
+{
+    return g_addEventHandler ? g_addEventHandler(lua)
+        : PushDirectResult(lua, false);
+}
+
+int __cdecl DirectRemoveEventHandler(void* lua)
+{
+    return g_removeEventHandler ? g_removeEventHandler(lua)
+        : PushDirectResult(lua, false);
+}
+
+bool CatcherId(void* lua, int index, std::uint32_t& id)
+{
+    const std::string text = LuaText(lua, index, 32, false);
+    const char* begin = text.data();
+    const char* end = begin + text.size();
+    const auto parsed = std::from_chars(begin, end, id);
+    return parsed.ec == std::errc{} && parsed.ptr == end && id;
+}
+
+int __cdecl DirectCatchServerEvent(void* lua)
+{
+    if(DarkFlameLuaGetTop(lua) < 3 || DarkFlameLuaType(lua, 1) != 4
+        || DarkFlameLuaType(lua, 3) != 6)
+    {
+        return PushDirectResult(lua, false);
+    }
+
+    const std::string name = LuaText(lua, 1, 512, false);
+    int skip{};
+    const std::string skipText = LuaText(lua, 2, 16, false);
+    const auto parsed = std::from_chars(skipText.data(),
+        skipText.data() + skipText.size(), skip);
+    void* owner{};
+    void* main{};
+    if(name.empty() || name == "<value>" || parsed.ec != std::errc{}
+        || parsed.ptr != skipText.data() + skipText.size() || skip < 0
+        || skip > 255 || !LuaIdentity(lua, owner, main))
+    {
+        return PushDirectResult(lua, false);
+    }
+
+    std::uint32_t id = g_nextCatcher.fetch_add(1, std::memory_order_relaxed);
+    if(!id)
+        id = g_nextCatcher.fetch_add(1, std::memory_order_relaxed);
+    DarkFlameLuaPushValue(lua, 3);
+    const int reference = DarkFlameLuaRef(lua, LuaRegistryIndex);
+    {
+        std::scoped_lock lock(g_catcherMutex);
+        g_eventCatchers.push_back({id, owner, main, name, reference, skip});
+    }
+    const std::string handle = std::to_string(id);
+    DarkFlameLuaPushString(lua, handle.c_str());
+    return 1;
+}
+
+int __cdecl DirectRemoveEventCatcher(void* lua)
+{
+    std::uint32_t id{};
+    void* owner{};
+    void* main{};
+    if(!CatcherId(lua, 1, id) || !LuaIdentity(lua, owner, main))
+        return PushDirectResult(lua, false);
+
+    int reference{-1};
+    {
+        std::scoped_lock lock(g_catcherMutex);
+        const auto catcher = std::find_if(g_eventCatchers.begin(),
+            g_eventCatchers.end(), [&](const EventCatcher& item)
+        {
+            return item.id == id && item.owner == owner && item.main == main;
+        });
+        if(catcher == g_eventCatchers.end())
+            return PushDirectResult(lua, false);
+        reference = catcher->reference;
+        g_eventCatchers.erase(catcher);
+    }
+    DarkFlameLuaUnref(lua, LuaRegistryIndex, reference);
+    return PushDirectResult(lua, true);
+}
+
+bool CatcherActive(std::uint32_t id)
+{
+    std::scoped_lock lock(g_catcherMutex);
+    return std::any_of(g_eventCatchers.begin(), g_eventCatchers.end(),
+        [id](const EventCatcher& item) { return item.id == id; });
+}
+
+void ClearEventCatchers(bool release)
+{
+    std::vector<EventCatcher> catchers;
+    {
+        std::scoped_lock lock(g_catcherMutex);
+        catchers.swap(g_eventCatchers);
+    }
+    if(!release)
+        return;
+    for(const EventCatcher& catcher : catchers)
+    {
+        if(LuaStateAlive(catcher.main, catcher.owner))
+        {
+            DarkFlameLuaUnref(catcher.main, LuaRegistryIndex,
+                catcher.reference);
+        }
+    }
+}
+
+void DispatchEventCatchers(void* lua)
+{
+    if(g_dispatchingCatchers || !lua || DarkFlameLuaGetTop(lua) < 1
+        || DarkFlameLuaType(lua, 1) != 4)
+    {
+        return;
+    }
+
+    void* owner{};
+    void* main{};
+    if(!LuaIdentity(lua, owner, main))
+        return;
+    const std::string name = LuaText(lua, 1, 512, false);
+    std::vector<EventCatcher> matches;
+    {
+        std::scoped_lock lock(g_catcherMutex);
+        std::copy_if(g_eventCatchers.begin(), g_eventCatchers.end(),
+            std::back_inserter(matches), [&](const EventCatcher& item)
+        {
+            return item.owner == owner && item.main == main && item.name == name;
+        });
+    }
+    if(matches.empty())
+        return;
+
+    const int top = DarkFlameLuaGetTop(lua);
+    g_dispatchingCatchers = true;
+    for(const EventCatcher& catcher : matches)
+    {
+        if(!CatcherActive(catcher.id))
+            continue;
+        DarkFlameLuaPushRef(lua, LuaRegistryIndex, catcher.reference);
+        if(DarkFlameLuaType(lua, -1) != 6)
+        {
+            DarkFlameLuaSetTop(lua, top);
+            continue;
+        }
+        const int first = std::min(top + 1, 2 + catcher.skip);
+        for(int index = first; index <= top; ++index)
+            DarkFlameLuaPushValue(lua, index);
+        const int result = DarkFlameLuaPCall(lua, top - first + 1, 0, 0);
+        if(result)
+        {
+            Log::Write(L"[lua-bridge] event catcher callback failed: "
+                + WideAscii(LuaText(lua, -1, 1024, false)));
+        }
+        DarkFlameLuaSetTop(lua, top);
+    }
+    g_dispatchingCatchers = false;
+}
+
+int __cdecl DirectEmulateKey(void* lua)
+{
+    const std::string key = LuaText(lua, 1, 32);
+    if(key == "rmb" || key == "lmb")
+        return DirectEmulateMouseButton(lua);
+    const int virtualKey = VirtualKey(key);
+    if(!virtualKey)
+    {
+        const DWORD now = GetTickCount();
+        DWORD logged = g_unknownKeyLogTick.load(std::memory_order_relaxed);
+        if(now - logged >= 1000 && g_unknownKeyLogTick.compare_exchange_strong(
+            logged, now, std::memory_order_relaxed))
+        {
+            Log::Write(L"[input] dfEmulateKey rejected unknown key: " + WideAscii(key));
+        }
+        return PushDirectResult(lua, false);
+    }
+
+    const bool pressed = DarkFlameLuaToBoolean(lua, 2) != 0;
+    HWND window = GameWindow();
+    const KeyPostResult posted = PostKey(window, virtualKey, pressed);
+
+    const std::uint32_t logged = g_keyEmulationLogs.fetch_add(1,
+        std::memory_order_relaxed);
+    if(!posted.posted || logged < 24)
+    {
+        wchar_t line[320]{};
+        swprintf_s(line, L"[input] key=%hs %s post=%u backend=PostMessage/reassert-v2 minimized=%u "
+            L"hwnd=0x%p scan=0x%X error=%lu", key.c_str(),
+            pressed ? L"down" : L"up", posted.posted ? 1u : 0u,
+            window && IsIconic(window) ? 1u : 0u,
+            window, posted.scan, static_cast<unsigned long>(posted.error));
+        Log::Write(line);
+    }
+    return PushDirectResult(lua, posted.posted);
+}
+
+int __cdecl DirectEmulateMouseButton(void* lua)
+{
+    const std::string button = LuaText(lua, 1, 16);
+    HWND window = GameWindow();
+    if(!window)
+        return PushDirectResult(lua, false);
+
+    UINT down{};
+    UINT up{};
+    WPARAM state{};
+    if(button == "right" || button == "rmb")
+    {
+        down = WM_RBUTTONDOWN;
+        up = WM_RBUTTONUP;
+        state = MK_RBUTTON;
+    }
+    else if(button == "left" || button == "lmb")
+    {
+        down = WM_LBUTTONDOWN;
+        up = WM_LBUTTONUP;
+        state = MK_LBUTTON;
+    }
+    else
+        return PushDirectResult(lua, false);
+
+    POINT point{};
+    if(!GetCursorPos(&point) || !ScreenToClient(window, &point))
+        point = {};
+    const bool pressed = DarkFlameLuaToBoolean(lua, 2) != 0;
+    return PushDirectResult(lua, PostMouseButton(window, down, up, state,
+        pressed, MAKELPARAM(point.x, point.y)));
+}
+
+int __cdecl DirectPlayAlertSignal(void* lua)
+{
+    return PushDirectResult(lua, PlayTramAlertSignal());
+}
+
+int __cdecl DirectSetAlertMonitorEnabled(void* lua)
+{
+    constexpr std::uint32_t DefaultSource = 1u;
+    constexpr std::uint32_t PilotSource = 2u;
+    const std::uint32_t source = CurrentLuaResource(lua) == "province_pilot"
+        ? PilotSource : DefaultSource;
+    if(DarkFlameLuaToBoolean(lua, 1) != 0)
+        g_alertMonitorSources.fetch_or(source, std::memory_order_acq_rel);
+    else
+        g_alertMonitorSources.fetch_and(~source, std::memory_order_acq_rel);
+    return PushDirectResult(lua, true);
+}
+
+int DirectDebugHook(void* lua, bool add)
+{
+    int hookType{};
+    if(!g_luaMToRef || !g_luaFunctionRefDtor
+        || DarkFlameLuaGetTop(lua) < 2 || !DebugHookType(lua, hookType)
+        || DarkFlameLuaType(lua, 2) != 6)
+    {
+        return PushDirectResult(lua, false);
+    }
+
+    std::vector<std::string> allowedNames;
+    if(add && !AllowedDebugHookNames(lua, allowedNames))
+        return PushDirectResult(lua, false);
+
+    void* manager = DebugHookManager();
+    if(!manager)
+        return PushDirectResult(lua, false);
+
+    LuaFunctionRefStorage functionRef{};
+    g_luaMToRef(&functionRef, lua, 2);
+    const bool result = add
+        ? g_addDebugHook && g_addDebugHook(manager, hookType, &functionRef,
+            &allowedNames)
+        : g_removeDebugHook && g_removeDebugHook(manager, hookType, &functionRef);
+    g_luaFunctionRefDtor(&functionRef);
+    return PushDirectResult(lua, result);
+}
+
+int __cdecl DirectAddDebugHook(void* lua)
+{
+    return DirectDebugHook(lua, true);
+}
+
+int __cdecl DirectRemoveDebugHook(void* lua)
+{
+    return DirectDebugHook(lua, false);
+}
+
+struct LuaMainEntry
+{
+    void* object;
+    void* state;
+    std::string resource;
+};
+
+struct LuaMainNode
+{
+    LuaMainNode* next;
+    LuaMainNode* previous;
+    void* value;
+};
+
+bool LuaManager(void*& manager)
+{
+    manager = nullptr;
+    return g_luaManagerSlot && ReadValue(g_luaManagerSlot, 0, manager) && manager;
+}
+
+bool ReadResourceName(void* resource, std::string& name)
+{
+    if(!resource)
+        return false;
+    const char* base = static_cast<const char*>(resource);
+    // Hardened builds keep CResource::m_strName at +0xC; older builds at +8.
+    for(const std::size_t offset : {std::size_t{0x0C}, std::size_t{0x08}})
+    {
+        std::string candidate;
+        if(!ReadSString(base + offset, candidate, 128) || candidate.empty())
+            continue;
+        const bool printable = std::all_of(candidate.begin(), candidate.end(),
+            [](unsigned char value)
+        {
+            return value >= 0x20 && value < 0x7F;
+        });
+        if(!printable)
+            continue;
+        name = std::move(candidate);
+        return true;
+    }
+    return false;
+}
+
+bool ReadLuaMain(void* object, LuaMainEntry& entry)
+{
+    void* resource{};
+    if(!object || !ReadValue(object, 24, entry.state) || !entry.state
+        || !ReadValue(object, 72, resource) || !resource
+        || !ReadResourceName(resource, entry.resource))
+    {
+        return false;
+    }
+    entry.object = object;
+    return !entry.resource.empty();
+}
+
+bool LuaIdentity(void* lua, void*& owner, void*& state)
+{
+    owner = nullptr;
+    state = lua;
+    if(!lua || !g_getVirtualMachine)
+        return false;
+    void* manager{};
+    if(!LuaManager(manager))
+        return false;
+    LuaMainEntry entry{};
+    if(!ReadLuaMain(g_getVirtualMachine(manager, lua), entry))
+        return false;
+    owner = entry.object;
+    state = entry.state;
+    return true;
+}
+
+bool LuaMains(std::vector<LuaMainEntry>& entries)
+{
+    entries.clear();
+    void* manager{};
+    if(!LuaManager(manager))
+        return false;
+
+    if(g_hardenedLuaManager)
+    {
+        // Hardened layout: CLuaManager+0x48 is a vector of 8-byte records
+        // holding two XOR-encoded dwords. The per-manager/session key cancels
+        // out when both halves are combined, so CLuaMain* can be recovered
+        // without calling the game's TLS-bound key helper (which is unsafe on
+        // threads created outside the client module).
+        std::uintptr_t begin{};
+        std::uintptr_t end{};
+        if(!ReadValue(manager, 0x48, begin) || !ReadValue(manager, 0x4C, end)
+            || end < begin || (end - begin) % 8 != 0)
+        {
+            return false;
+        }
+        if(begin == end)
+            return true;
+        const std::uintptr_t count = (end - begin) / 8;
+        if(count > 4096)
+            return false;
+        constexpr std::uint32_t xorKeys[] = {
+            0x3A51u ^ 0x7B17u,
+            0x31415926u ^ 0x3A51u ^ 0x7B17u,
+        };
+        for(std::uintptr_t index = 0; index < count; ++index)
+        {
+            std::uint32_t low{};
+            std::uint32_t high{};
+            const void* record = reinterpret_cast<const void*>(begin + index * 8);
+            if(!ReadValue(record, 0, low) || !ReadValue(record, 4, high))
+                return false;
+            for(const std::uint32_t xorKey : xorKeys)
+            {
+                const std::uint32_t main = low ^ high ^ xorKey;
+                if(!main)
+                    continue;
+                LuaMainEntry entry{};
+                if(ReadLuaMain(reinterpret_cast<void*>(
+                    static_cast<std::uintptr_t>(main)), entry))
+                {
+                    entries.push_back(std::move(entry));
+                    break;
+                }
+            }
+        }
+        static std::atomic_bool layoutLogged{};
+        if(!entries.empty() && !layoutLogged.exchange(true))
+        {
+            std::wstring names;
+            for(const LuaMainEntry& entry : entries)
+            {
+                if(!names.empty())
+                    names += L", ";
+                names += WideAscii(entry.resource);
+            }
+            Log::Write(L"[lua-bridge] hardened VM layout active, "
+                + std::to_wstring(entries.size()) + L" resource(s): " + names);
+        }
+        return true;
+    }
+
+    LuaMainNode* head{};
+    LuaMainNode value{};
+    if(!ReadValue(manager, 68, head) || !head
+        || !ReadValue(head, 0, value))
+    {
+        return false;
+    }
+
+    LuaMainNode* node = value.next;
+    for(std::size_t count = 0; node && node != head && count < 4096; ++count)
+    {
+        if(!ReadValue(node, 0, value))
+            return false;
+        LuaMainEntry entry{};
+        if(ReadLuaMain(value.value, entry))
+            entries.push_back(std::move(entry));
+        node = value.next;
+    }
+    return node == head;
+}
+
+bool LuaStateAlive(void* state, void* owner)
+{
+    std::vector<LuaMainEntry> entries;
+    if(!LuaMains(entries))
+        return false;
+    return std::any_of(entries.begin(), entries.end(),
+        [state, owner](const LuaMainEntry& entry)
+    {
+        return entry.state == state
+            && (!owner || entry.object == owner);
+    });
+}
+
+bool FindResourceState(std::string_view resource, LuaMainEntry& found)
+{
+    std::vector<LuaMainEntry> entries;
+    if(!LuaMains(entries))
+        return false;
+    const auto match = std::find_if(entries.begin(), entries.end(),
+        [resource](const LuaMainEntry& entry)
+    {
+        return entry.resource.size() == resource.size()
+            && !_strnicmp(entry.resource.c_str(), resource.data(), resource.size());
+    });
+    if(match == entries.end())
+        return false;
+    found = *match;
+    return true;
+}
+
+bool FindBootstrapState(LuaMainEntry& found)
+{
+    std::vector<LuaMainEntry> entries;
+    if(!LuaMains(entries) || entries.empty())
+        return false;
+    found = std::move(entries.front());
+    return true;
+}
+
+std::string CurrentLuaResource(void* lua)
+{
+    if(!lua || !g_luaManagerSlot || !g_getVirtualMachine)
+        return "unknown";
+    void* manager{};
+    if(!ReadValue(g_luaManagerSlot, 0, manager) || !manager)
+        return "unknown";
+    void* luaMain = g_getVirtualMachine(manager, lua);
+    LuaMainEntry entry{};
+    return ReadLuaMain(luaMain, entry) ? entry.resource : "unknown";
+}
+
+std::string ManagedChunk(std::uintptr_t id, std::string_view userCode)
+{
+    const std::string key = LuaLiteral(ThreadKey(id));
+    std::string code;
+    code.reserve(userCode.size() + 2300);
+    code += "local B=_G local K=" + key
+        + " local S=rawget(B,'__darkFlameThreads') "
+        "if not S then S={} rawset(B,'__darkFlameThreads',S) end "
+        "local C={} local function T(f) C[#C+1]=f end local E={} E._G=E "
+        "E.onUnload=function(f) if B.type(f)=='function' then T(f) return true end return false end "
+        "E.triggerServerEvent=B.dfTriggerServerEvent E.dfSyncEvent=B.dfSyncEvent "
+        "E.triggerEvent=B.dfTriggerEvent "
+        "E.addEvent=B.dfAddEvent E.removeEventHandler=B.dfRemoveEventHandler "
+        "E.addDebugHook=function(t,f,n) local o=B.dfAddDebugHook(t,f,n) "
+        "if o then T(function() B.dfRemoveDebugHook(t,f) end) end return o end "
+        "E.removeDebugHook=B.dfRemoveDebugHook "
+        "E.dfCatchServerEvent=function(n,s,f) local o=B.dfCatchServerEvent(n,s,f) "
+        "if o then T(function() B.dfRemoveEventCatcher(o) end) end return o end "
+        "E.dfRemoveEventCatcher=B.dfRemoveEventCatcher "
+        "E.setTimer=function(f,d,n,...) local t=B.setTimer(f,d,n,...) "
+        "if t then T(function() if B.isTimer(t) then B.killTimer(t) end end) end return t end "
+        "E.addEventHandler=function(n,e,f,...) local o=B.dfAddEventHandler(n,e,f,...) "
+        "if o then T(function() B.dfRemoveEventHandler(n,e,f) end) end return o end "
+        "E.bindKey=function(k,s,f,...) local o=B.bindKey(k,s,f,...) "
+        "if o then T(function() B.unbindKey(k,s,f) end) end return o end "
+        "E.addCommandHandler=function(n,f,...) local o=B.addCommandHandler(n,f,...) "
+        "if o then T(function() B.removeCommandHandler(n,f) end) end return o end "
+        "E.createElement=function(...) local e=B.createElement(...) "
+        "if e then T(function() if B.isElement(e) then B.destroyElement(e) end end) end return e end "
+        "B.setmetatable(E,{__index=B}) local function F(...)\n";
+    code.append(userCode);
+    code += "\nend B.setfenv(F,E) S[K]={cleanup=C} "
+        "local O,R=B.pcall(F) if not O then B.error(R,0) end return R";
+    return code;
+}
+
+std::string CleanupChunk(std::uintptr_t id)
+{
+    return "local S=rawget(_G,'__darkFlameThreads') local T=S and S["
+        + LuaLiteral(ThreadKey(id))
+        + "] if T then for I=#T.cleanup,1,-1 do pcall(T.cleanup[I]) end "
+        "S[" + LuaLiteral(ThreadKey(id)) + "]=nil end";
+}
+
+bool RunLuaChunk(void* lua, std::string_view code, std::string& error)
+{
+    const int top = DarkFlameLuaGetTop(lua);
+    if(top)
+    {
+        error = "embedded parser requires an empty Lua stack";
+        return false;
+    }
+    int result = DarkFlameLoadLuaSource(lua, code.data(), code.size(),
+        "@DarkFlame");
+    if(!result)
+        result = DarkFlameLuaPCall(lua, 0, 0, 0);
+    if(result)
+    {
+        std::size_t length{};
+        const char* text = DarkFlameLuaToLString(lua, -1, &length);
+        error = text ? std::string(text, std::min(length, std::size_t{2048}))
+            : "<value>";
+    }
+    DarkFlameLuaSetTop(lua, top);
+    return result == 0;
+}
+
+void RemoveSession(std::vector<LuaSession>::iterator session, bool release)
+{
+    const std::uintptr_t id = session->id;
+    if(release)
+    {
+        std::string ignored;
+        g_scopeDepth.fetch_add(1, std::memory_order_acq_rel);
+        RunLuaChunk(session->thread, CleanupChunk(id), ignored);
+        DarkFlameLuaUnref(session->main, LuaRegistryIndex, session->reference);
+        g_scopeDepth.fetch_sub(1, std::memory_order_acq_rel);
+    }
+    g_sessions.erase(session);
+    GuiRemoveLuaThread(id);
+}
+
+void PruneDeadSessions()
+{
+    if(g_sessions.empty())
+        return;
+    std::vector<LuaMainEntry> entries;
+    if(!LuaMains(entries))
+        return;
+    for(auto session = g_sessions.begin(); session != g_sessions.end();)
+    {
+        const bool alive = std::any_of(entries.begin(), entries.end(),
+            [&](const LuaMainEntry& entry)
+        {
+            return entry.state == session->main
+                && entry.object == session->owner;
+        });
+        if(alive)
+            ++session;
+        else
+        {
+            const std::uintptr_t id = session->id;
+            session = g_sessions.erase(session);
+            GuiRemoveLuaThread(id);
+        }
+    }
+}
+
+bool InjectIntoResource(std::string_view resource, std::string_view code,
+    std::uintptr_t& id, std::string& error)
+{
+    PruneDeadSessions();
+    LuaMainEntry target{};
+    if(resource.empty() || !FindResourceState(resource, target))
+    {
+        error = "resource VM not found: " + std::string(resource);
+        return false;
+    }
+
+    const int mainTop = DarkFlameLuaGetTop(target.state);
+    void* thread = g_luaNewThread(target.state);
+    if(!thread)
+    {
+        DarkFlameLuaSetTop(target.state, mainTop);
+        error = "lua_newthread failed";
+        return false;
+    }
+    const int reference = DarkFlameLuaRef(target.state, LuaRegistryIndex);
+    DarkFlameLuaSetTop(target.state, mainTop);
+    if(!DarkFlameLuaInstallPrivateGlobals(thread))
+    {
+        DarkFlameLuaUnref(target.state, LuaRegistryIndex, reference);
+        error = "private globals initialization failed";
+        return false;
+    }
+    RegisterDirectAliases(thread);
+    id = reinterpret_cast<std::uintptr_t>(thread);
+
+    g_scopeDepth.fetch_add(1, std::memory_order_acq_rel);
+    const bool executed = RunLuaChunk(thread, ManagedChunk(id, code), error);
+    g_scopeDepth.fetch_sub(1, std::memory_order_acq_rel);
+    if(!executed)
+    {
+        std::string ignored;
+        RunLuaChunk(thread, CleanupChunk(id), ignored);
+        DarkFlameLuaUnref(target.state, LuaRegistryIndex, reference);
+        return false;
+    }
+
+    g_sessions.push_back({id, target.object, target.state, thread, reference,
+        target.resource});
+    GuiAddLuaThread({id, Timestamp(), target.resource});
+    Log::Write(L"[lua-bridge] Lua thread started: " + WideAscii(ThreadKey(id))
+        + L" resource=" + WideAscii(target.resource));
+    return true;
+}
+
+void DrainThreadRequests()
+{
+    PruneDeadSessions();
+    std::uintptr_t id{};
+    while(GuiTakeUnloadThread(id))
+    {
+        const auto session = std::find_if(g_sessions.begin(), g_sessions.end(),
+            [id](const LuaSession& item) { return item.id == id; });
+        if(session == g_sessions.end())
+            continue;
+        RemoveSession(session, LuaStateAlive(session->main, session->owner));
+        Log::Write(L"[lua-bridge] Lua thread unloaded: " + WideAscii(ThreadKey(id)));
+        if(id && id == g_plowSession.load(std::memory_order_acquire))
+        {
+            g_plowUserUnloaded.store(true, std::memory_order_release);
+            g_plowSession.store(0, std::memory_order_release);
+            g_plowState.store(0, std::memory_order_release);
+            PlowSetLoad(PlowLoad::Unloaded,
+                "Eltávolítva a Lua Threads fülön. „Szkript betöltése” — visszahozza");
+            Log::Write(L"[plow] unloaded by user; automatic loading paused");
+        }
+    }
+}
+
+bool ReadLuaScript(const std::wstring& path, std::string_view name,
+    std::string& code, std::string& error)
+{
+    code.clear();
+    if(path.empty())
+    {
+        error = "DarkFlame directory is unavailable";
+        return false;
+    }
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if(file == INVALID_HANDLE_VALUE)
+    {
+        error = std::string(name) + " not found beside DarkFlame.exe";
+        return false;
+    }
+    LARGE_INTEGER size{};
+    if(!GetFileSizeEx(file, &size) || size.QuadPart <= 0
+        || size.QuadPart > 4 * 1024 * 1024)
+    {
+        CloseHandle(file);
+        error = std::string(name) + " has an invalid size";
+        return false;
+    }
+    code.resize(static_cast<std::size_t>(size.QuadPart));
+    DWORD read{};
+    const bool loaded = ReadFile(file, code.data(), static_cast<DWORD>(code.size()),
+        &read, nullptr) && read == static_cast<DWORD>(code.size());
+    CloseHandle(file);
+    if(!loaded)
+    {
+        code.clear();
+        error = std::string(name) + " read failed";
+        return false;
+    }
+    if(code.size() >= 3 && static_cast<unsigned char>(code[0]) == 0xEF
+        && static_cast<unsigned char>(code[1]) == 0xBB
+        && static_cast<unsigned char>(code[2]) == 0xBF)
+    {
+        code.erase(0, 3);
+    }
+    if(code.find('\0') != std::string::npos)
+    {
+        code.clear();
+        error = std::string(name) + " contains a zero byte";
+        return false;
+    }
+    return true;
+}
+
+bool ScriptFileStamp(const std::wstring& path, ULONGLONG& time, ULONGLONG& size)
+{
+    WIN32_FILE_ATTRIBUTE_DATA data{};
+    if(path.empty() || !GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &data))
+        return false;
+    time = (static_cast<ULONGLONG>(data.ftLastWriteTime.dwHighDateTime) << 32)
+        | data.ftLastWriteTime.dwLowDateTime;
+    size = (static_cast<ULONGLONG>(data.nFileSizeHigh) << 32) | data.nFileSizeLow;
+    return true;
+}
+
+std::string LocalClock()
+{
+    SYSTEMTIME now{};
+    GetLocalTime(&now);
+    char text[16]{};
+    std::snprintf(text, sizeof(text), "%02u:%02u:%02u", now.wHour, now.wMinute, now.wSecond);
+    return text;
+}
+
+void BuildBootstrapPayload(std::wstring_view loaderDirectory)
+{
+    g_tramScriptPath = loaderDirectory.empty() ? std::wstring{}
+        : std::wstring(loaderDirectory) + L"\\TramBot.lua";
+    g_jbkScriptPath = loaderDirectory.empty() ? std::wstring{}
+        : std::wstring(loaderDirectory) + L"\\JBKBot.lua";
+    g_pilotScriptPath = loaderDirectory.empty() ? std::wstring{}
+        : std::wstring(loaderDirectory) + L"\\PilotTelemetry.lua";
+    g_plowScriptPath = loaderDirectory.empty() ? std::wstring{}
+        : std::wstring(loaderDirectory) + L"\\PlowBot.lua";
+    g_bootstrapPayload.assign(LuaBridgePayload::Bootstrap);
+    g_tramPayload.clear();
+    g_jbkPayload.clear();
+    g_pilotPayload.clear();
+    g_plowPayload.clear();
+    std::string tram;
+    std::string tramError;
+    if(ReadLuaScript(g_tramScriptPath, "TramBot.lua", tram, tramError))
+    {
+        g_tramPayload = std::move(tram);
+        Log::Write(L"[trambot] direct bootstrap core ready: "
+            + std::to_wstring(g_bootstrapPayload.size())
+            + L" bytes; TramBot staged: "
+            + std::to_wstring(g_tramPayload.size()) + L" bytes");
+    }
+    else
+    {
+        GuiUpdateTramState("loaded", "0");
+        GuiUpdateTramState("status", tramError);
+        Log::Write(L"[trambot] direct bootstrap contains core only: "
+            + WideAscii(tramError));
+    }
+
+    std::string jbk;
+    std::string jbkError;
+    if(ReadLuaScript(g_jbkScriptPath, "JBKBot.lua", jbk, jbkError))
+    {
+        g_jbkPayload = std::move(jbk);
+        Log::Write(L"[jbkbot] staged beside TramBot: "
+            + std::to_wstring(g_jbkPayload.size()) + L" bytes");
+    }
+    else
+    {
+        GuiUpdateJbkState("loaded", "0");
+        GuiUpdateJbkState("status", jbkError);
+        Log::Write(L"[jbkbot] not staged: " + WideAscii(jbkError));
+    }
+
+    std::string pilot;
+    std::string pilotError;
+    if(ReadLuaScript(g_pilotScriptPath, "PilotTelemetry.lua", pilot, pilotError))
+    {
+        g_pilotPayload = std::move(pilot);
+        Log::Write(L"[pilot] staged for province_pilot: "
+            + std::to_wstring(g_pilotPayload.size()) + L" bytes");
+    }
+    else
+    {
+        Log::Write(L"[pilot] not staged: " + WideAscii(pilotError));
+    }
+
+    std::string plow;
+    std::string plowError;
+    g_plowNext.clear();
+    g_plowSeenTick = 0;
+    if(!ScriptFileStamp(g_plowScriptPath, g_plowFileTime, g_plowFileSize))
+        g_plowFileTime = g_plowFileSize = 0;
+    if(ReadLuaScript(g_plowScriptPath, "PlowBot.lua", plow, plowError))
+    {
+        g_plowPayload = std::move(plow);
+        PlowSetScript(PlowScriptVersion(g_plowPayload), g_plowPayload.size());
+        Log::Write(L"[plow] staged for province_snowPlow: "
+            + std::to_wstring(g_plowPayload.size()) + L" bytes");
+    }
+    else
+    {
+        PlowSetScript({}, 0);
+        PlowSetLoad(PlowLoad::Error, plowError);
+        Log::Write(L"[plow] not staged: " + WideAscii(plowError));
+    }
+}
+
+void RunDirectBootstrap()
+{
+    if (g_bootstrapPayload.empty())
+        return;
+
+    // A previous attempt can only stay in state 3 if it aborted without
+    // reaching either terminal branch (for example due to an SEH abort).
+    // Recover after a grace period so the bridge never stays dead forever.
+    static std::atomic<DWORD> bootstrapStartedAt{};
+    const DWORD now = GetTickCount();
+    if(g_bootstrapState.load(std::memory_order_acquire) == 3)
+    {
+        const DWORD started = bootstrapStartedAt.load(std::memory_order_relaxed);
+        if(started && now - started < 4000)
+            return;
+        std::uint32_t stale = 3;
+        if(!g_bootstrapState.compare_exchange_strong(stale, 0,
+            std::memory_order_acq_rel, std::memory_order_acquire))
+        {
+            return;
+        }
+        bootstrapStartedAt.store(0, std::memory_order_relaxed);
+        Log::Write(L"[lua-bridge] bootstrap attempt recovered after stall");
+    }
+
+    std::uint32_t expected{};
+    if(!g_bootstrapState.compare_exchange_strong(expected, 3,
+        std::memory_order_acq_rel, std::memory_order_acquire))
+    {
+        return;
+    }
+    bootstrapStartedAt.store(now, std::memory_order_relaxed);
+
+    static std::atomic_int attempts{};
+    const int attempt = ++attempts;
+    const bool verbose = attempt <= 3 || attempt % 400 == 0;
+
+    LuaMainEntry target{};
+    if(!FindBootstrapState(target))
+    {
+        g_bootstrapState.store(0, std::memory_order_release);
+        if(verbose)
+        {
+            Log::Write(L"[lua-bridge] bootstrap attempt " + std::to_wstring(attempt)
+                + L": FindBootstrapState failed");
+        }
+        return;
+    }
+    void* owner = target.object;
+    void* main = target.state;
+    void* lua = target.state;
+    if(verbose)
+    {
+        Log::Write(L"[lua-bridge] bootstrap attempt " + std::to_wstring(attempt)
+            + L": carrier=" + WideAscii(target.resource)
+            + L" owner=" + WideAscii(Hex(reinterpret_cast<std::uintptr_t>(owner)))
+            + L" state=" + WideAscii(Hex(reinterpret_cast<std::uintptr_t>(lua))));
+    }
+    const int top = DarkFlameLuaGetTop(lua);
+    void* thread = g_luaNewThread(lua);
+    const int reference = thread
+        ? DarkFlameLuaRef(lua, LuaRegistryIndex) : -1;
+    DarkFlameLuaSetTop(lua, top);
+    std::string error;
+    if(!thread)
+        error = "lua_newthread failed";
+    const bool privateGlobals = thread
+        && DarkFlameLuaInstallPrivateGlobals(thread);
+    if(privateGlobals)
+        RegisterBridge(thread);
+    else if(thread)
+        error = "private globals initialization failed";
+    if(verbose)
+    {
+        Log::Write(L"[lua-bridge] bootstrap thread="
+            + WideAscii(Hex(reinterpret_cast<std::uintptr_t>(thread))) + L" globals="
+            + (privateGlobals ? L"ok" : L"fail"));
+    }
+    const bool executed = privateGlobals
+        && RunLuaChunk(thread, g_bootstrapPayload, error);
+    g_hideCalls.store(false, std::memory_order_release);
+    if(reference >= 0)
+        DarkFlameLuaUnref(lua, LuaRegistryIndex, reference);
+    if(verbose)
+    {
+        Log::Write(L"[lua-bridge] bootstrap executed="
+            + std::wstring(executed ? L"yes" : L"no")
+            + L" error=" + WideAscii(error));
+    }
+
+    if(executed && owner)
+    {
+        g_bootstrapError.clear();
+        g_bootstrapMain.store(owner, std::memory_order_release);
+        g_bootstrapLua.store(main, std::memory_order_release);
+        g_bootstrapState.store(2, std::memory_order_release);
+        if(!g_plowUserUnloaded.load(std::memory_order_acquire))
+            PlowSetLoad(PlowLoad::Waiting, "A híd kész, várom a province_snowPlow erőforrást");
+        Log::Write(L"[lua-bridge] private embedded runtime carrier="
+            + WideAscii(target.resource));
+        return;
+    }
+
+    if(error.empty())
+        error = owner ? "embedded parser bootstrap failed"
+            : "Lua VM identity unavailable";
+    g_bootstrapLua.store(nullptr, std::memory_order_release);
+    g_bootstrapMain.store(nullptr, std::memory_order_release);
+    g_bootstrapState.store(0, std::memory_order_release);
+    GuiUpdateTramState("loaded", "0");
+    GuiUpdateTramState("status", error);
+    GuiUpdateJbkState("loaded", "0");
+    GuiUpdateJbkState("status", error);
+    if(error != g_bootstrapError)
+    {
+        g_bootstrapError = error;
+        PlowSetLoad(PlowLoad::Error, "A Lua híd nem indult el: " + error);
+        Log::Write(L"[lua-bridge] embedded parser bootstrap failed: "
+            + WideAscii(error));
+    }
+}
+
+void TryStartTramBot()
+{
+    if(g_bootstrapState.load(std::memory_order_acquire) != 2
+        || g_tramPayload.empty()
+        || g_tramState.load(std::memory_order_acquire) == 2)
+    {
+        return;
+    }
+    const DWORD now = GetTickCount();
+    DWORD checked = g_tramRetryTick.load(std::memory_order_relaxed);
+    if(now - checked < 500 || !g_tramRetryTick.compare_exchange_strong(
+        checked, now, std::memory_order_relaxed))
+    {
+        return;
+    }
+    std::uint32_t expected{};
+    if(!g_tramState.compare_exchange_strong(expected, 1,
+        std::memory_order_acq_rel, std::memory_order_acquire))
+    {
+        return;
+    }
+
+    std::uintptr_t id{};
+    std::string error;
+    if(InjectIntoResource("province_tram", g_tramPayload, id, error))
+    {
+        g_tramSession.store(id, std::memory_order_release);
+        g_tramState.store(2, std::memory_order_release);
+        Log::Write(L"[trambot] runtime injection started in province_tram: "
+            + WideAscii(ThreadKey(id)));
+        return;
+    }
+
+    g_tramState.store(0, std::memory_order_release);
+    GuiUpdateTramState("loaded", "0");
+    GuiUpdateTramState("status", error);
+    static std::string previousError;
+    if(error != previousError)
+    {
+        previousError = error;
+        Log::Write(L"[trambot] runtime injection pending: " + WideAscii(error));
+    }
+}
+
+void TryStartJbkBot()
+{
+    if(g_bootstrapState.load(std::memory_order_acquire) != 2
+        || g_jbkPayload.empty()
+        || g_jbkState.load(std::memory_order_acquire) == 2)
+    {
+        return;
+    }
+    const DWORD now = GetTickCount();
+    DWORD checked = g_jbkRetryTick.load(std::memory_order_relaxed);
+    if(now - checked < 500 || !g_jbkRetryTick.compare_exchange_strong(
+        checked, now, std::memory_order_relaxed))
+    {
+        return;
+    }
+    std::uint32_t expected{};
+    if(!g_jbkState.compare_exchange_strong(expected, 1,
+        std::memory_order_acq_rel, std::memory_order_acquire))
+    {
+        return;
+    }
+
+    std::uintptr_t id{};
+    std::string error;
+    if(InjectIntoResource("province_tram", g_jbkPayload, id, error))
+    {
+        g_jbkSession.store(id, std::memory_order_release);
+        g_jbkState.store(2, std::memory_order_release);
+        Log::Write(L"[jbkbot] runtime injection started in province_tram: "
+            + WideAscii(ThreadKey(id)));
+        return;
+    }
+
+    g_jbkState.store(0, std::memory_order_release);
+    GuiUpdateJbkState("loaded", "0");
+    GuiUpdateJbkState("status", error);
+    static std::string previousError;
+    if(error != previousError)
+    {
+        previousError = error;
+        Log::Write(L"[jbkbot] runtime injection pending: " + WideAscii(error));
+    }
+}
+
+void TryStartPilotBot()
+{
+    if(g_bootstrapState.load(std::memory_order_acquire) != 2
+        || g_pilotPayload.empty()
+        || g_pilotState.load(std::memory_order_acquire) == 2)
+    {
+        return;
+    }
+    const DWORD now = GetTickCount();
+    DWORD checked = g_pilotRetryTick.load(std::memory_order_relaxed);
+    if(now - checked < 500 || !g_pilotRetryTick.compare_exchange_strong(
+        checked, now, std::memory_order_relaxed))
+    {
+        return;
+    }
+    std::uint32_t expected{};
+    if(!g_pilotState.compare_exchange_strong(expected, 1,
+        std::memory_order_acq_rel, std::memory_order_acquire))
+    {
+        return;
+    }
+
+    std::uintptr_t id{};
+    std::string error;
+    if(InjectIntoResource("province_pilot", g_pilotPayload, id, error))
+    {
+        g_pilotSession.store(id, std::memory_order_release);
+        g_pilotState.store(2, std::memory_order_release);
+        Log::Write(L"[pilot] runtime injection started in province_pilot: "
+            + WideAscii(ThreadKey(id)));
+        return;
+    }
+
+    g_pilotState.store(0, std::memory_order_release);
+    static std::string previousError;
+    if(error != previousError)
+    {
+        previousError = error;
+        Log::Write(L"[pilot] runtime injection pending: " + WideAscii(error));
+    }
+}
+
+constexpr std::string_view PlowResource = "province_snowPlow";
+
+bool PlowSessionAlive()
+{
+    PruneDeadSessions();
+    const std::uintptr_t id = g_plowSession.load(std::memory_order_acquire);
+    return id && std::any_of(g_sessions.begin(), g_sessions.end(),
+        [id](const LuaSession& item) { return item.id == id; });
+}
+
+bool LuaCompiles(std::string_view resource, std::string_view code, std::string& error)
+{
+    LuaMainEntry target{};
+    if(!FindResourceState(resource, target))
+    {
+        error = "resource VM not found: " + std::string(resource);
+        return false;
+    }
+    const int mainTop = DarkFlameLuaGetTop(target.state);
+    void* thread = g_luaNewThread(target.state);
+    if(!thread)
+    {
+        DarkFlameLuaSetTop(target.state, mainTop);
+        error = "lua_newthread failed";
+        return false;
+    }
+    const std::string chunk = ManagedChunk(0, code);
+    const int result = DarkFlameLoadLuaSource(thread, chunk.data(), chunk.size(), "@DarkFlame");
+    if(result)
+    {
+        std::size_t length{};
+        const char* text = DarkFlameLuaToLString(thread, -1, &length);
+        error = text ? std::string(text, std::min(length, std::size_t{512})) : "<value>";
+    }
+    DarkFlameLuaSetTop(thread, 0);
+    DarkFlameLuaSetTop(target.state, mainTop);
+    return result == 0;
+}
+
+void RemovePlowSession()
+{
+    const std::uintptr_t id = g_plowSession.exchange(0, std::memory_order_acq_rel);
+    const auto session = std::find_if(g_sessions.begin(), g_sessions.end(),
+        [id](const LuaSession& item) { return item.id == id; });
+    if(id && session != g_sessions.end())
+    {
+        RemoveSession(session, LuaStateAlive(session->main, session->owner));
+        Log::Write(L"[plow] previous Lua thread unloaded: " + WideAscii(ThreadKey(id)));
+    }
+}
+
+void SetPlowLoadError(PlowLoad kind, const std::string& text)
+{
+    if(text == g_plowStatusError)
+        return;
+    g_plowStatusError = text;
+    PlowSetLoad(kind, text);
+}
+
+void WatchPlowScript(DWORD now, bool force)
+{
+    if(!force && now - g_plowWatchTick < 1000)
+        return;
+    g_plowWatchTick = now;
+    ULONGLONG time{}, size{};
+    if(!ScriptFileStamp(g_plowScriptPath, time, size))
+    {
+        if(force)
+            SetPlowLoadError(PlowLoad::Error, "A PlowBot.lua nem található a DarkFlame.exe mellett");
+        return;
+    }
+    if(!force)
+    {
+        if(time == g_plowFileTime && size == g_plowFileSize)
+            return;
+        if(time != g_plowSeenTime || size != g_plowSeenSize || !g_plowSeenTick)
+        {
+            g_plowSeenTime = time;
+            g_plowSeenSize = size;
+            g_plowSeenTick = now ? now : 1;
+            return;
+        }
+        if(now - g_plowSeenTick < 1500)
+            return;
+        if(!PlowAutoReload() && g_plowState.load(std::memory_order_acquire) == 2)
+        {
+            g_plowStatusError.clear();
+            PlowSetLoad(PlowLoad::Pending,
+                "Új PlowBot.lua van a mappában — „Szkript újratöltése” az átvételhez");
+            return;
+        }
+    }
+    std::string code;
+    std::string error;
+    g_plowFileTime = time;
+    g_plowFileSize = size;
+    g_plowSeenTick = 0;
+    if(!ReadLuaScript(g_plowScriptPath, "PlowBot.lua", code, error))
+    {
+        SetPlowLoadError(PlowLoad::Error, error);
+        return;
+    }
+    if(!force && code == g_plowPayload)
+        return;
+    Log::Write(L"[plow] PlowBot.lua " + std::wstring(force ? L"reload requested" : L"changed on disk")
+        + L": " + std::to_wstring(code.size()) + L" bytes, version "
+        + WideAscii(PlowScriptVersion(code)));
+    if(g_plowState.load(std::memory_order_acquire) != 2)
+    {
+        g_plowPayload = std::move(code);
+        g_plowNext.clear();
+        PlowSetScript(PlowScriptVersion(g_plowPayload), g_plowPayload.size());
+        return;
+    }
+    g_plowNext = std::move(code);
+}
+
+void ReloadPlowBot()
+{
+    std::string error;
+    if(!LuaCompiles(PlowResource, g_plowNext, error))
+    {
+        Log::Write(L"[plow] new PlowBot.lua rejected: " + WideAscii(error));
+        SetPlowLoadError(PlowLoad::Error, "Az új PlowBot.lua hibás, a régi fut tovább: "
+            + PlowScriptVersion(g_plowPayload) + ": " + error);
+        g_plowNext.clear();
+        return;
+    }
+    RemovePlowSession();
+    std::uintptr_t id{};
+    if(InjectIntoResource(PlowResource, g_plowNext, id, error))
+    {
+        g_plowPayload = std::move(g_plowNext);
+        g_plowNext.clear();
+        g_plowSession.store(id, std::memory_order_release);
+        g_plowState.store(2, std::memory_order_release);
+        g_plowStatusError.clear();
+        PlowSetScript(PlowScriptVersion(g_plowPayload), g_plowPayload.size());
+        PlowSetLoad(PlowLoad::Loaded, "Újratöltve: " + LocalClock()
+            + " játékújraindítás nélkül");
+        Log::Write(L"[plow] reloaded in province_snowPlow: " + WideAscii(ThreadKey(id))
+            + L", version " + WideAscii(PlowScriptVersion(g_plowPayload)));
+        return;
+    }
+    Log::Write(L"[plow] new PlowBot.lua failed to start: " + WideAscii(error));
+    g_plowNext.clear();
+    const std::string failed = error;
+    if(InjectIntoResource(PlowResource, g_plowPayload, id, error))
+    {
+        g_plowSession.store(id, std::memory_order_release);
+        g_plowState.store(2, std::memory_order_release);
+        SetPlowLoadError(PlowLoad::Error, "Az új PlowBot.lua elindításkor elszállt, visszaállt a régi: "
+            + PlowScriptVersion(g_plowPayload) + ": " + failed);
+        return;
+    }
+    g_plowState.store(0, std::memory_order_release);
+    SetPlowLoadError(PlowLoad::Error, "Nem töltődött be: " + failed);
+}
+
+void TryStartPlowBot()
+{
+    if(g_bootstrapState.load(std::memory_order_acquire) != 2)
+        return;
+    const DWORD now = GetTickCount();
+    const bool reload = PlowTakeReload();
+    if(reload)
+    {
+        g_plowUserUnloaded.store(false, std::memory_order_release);
+        g_plowStatusError.clear();
+    }
+    WatchPlowScript(now, reload);
+    if(g_plowUserUnloaded.load(std::memory_order_acquire) || g_plowPayload.empty())
+        return;
+
+    if(g_plowState.load(std::memory_order_acquire) == 2)
+    {
+        if(now - g_plowAliveTick >= 1000)
+        {
+            g_plowAliveTick = now;
+            if(!PlowSessionAlive())
+            {
+                g_plowSession.store(0, std::memory_order_release);
+                g_plowState.store(0, std::memory_order_release);
+                g_plowStatusError.clear();
+                PlowSetLoad(PlowLoad::Waiting,
+                    "A province_snowPlow erőforrás újraindult — újratöltöm");
+                Log::Write(L"[plow] Lua thread lost (resource restarted); loading again");
+                return;
+            }
+        }
+        if(g_plowNext.empty())
+            return;
+        if(!reload && PlowBotBusy())
+        {
+            g_plowStatusError.clear();
+            PlowSetLoad(PlowLoad::Pending, "Az új verzió: " + PlowScriptVersion(g_plowNext)
+                + " akkor töltődik be, amikor a bot leáll");
+            return;
+        }
+        ReloadPlowBot();
+        return;
+    }
+
+    DWORD checked = g_plowRetryTick.load(std::memory_order_relaxed);
+    if(now - checked < 500 || !g_plowRetryTick.compare_exchange_strong(
+        checked, now, std::memory_order_relaxed))
+    {
+        return;
+    }
+    std::uint32_t expected{};
+    if(!g_plowState.compare_exchange_strong(expected, 1,
+        std::memory_order_acq_rel, std::memory_order_acquire))
+    {
+        return;
+    }
+    if(!g_plowNext.empty())
+    {
+        g_plowPayload = std::move(g_plowNext);
+        g_plowNext.clear();
+        PlowSetScript(PlowScriptVersion(g_plowPayload), g_plowPayload.size());
+    }
+
+    std::uintptr_t id{};
+    std::string error;
+    if(InjectIntoResource(PlowResource, g_plowPayload, id, error))
+    {
+        g_plowSession.store(id, std::memory_order_release);
+        g_plowState.store(2, std::memory_order_release);
+        g_plowStatusError.clear();
+        PlowSetLoad(PlowLoad::Loaded, "Automatikusan betöltve: " + LocalClock());
+        Log::Write(L"[plow] runtime injection started in province_snowPlow: "
+            + WideAscii(ThreadKey(id)));
+        return;
+    }
+
+    g_plowState.store(0, std::memory_order_release);
+    if(error.rfind("resource VM not found", 0) == 0)
+        SetPlowLoadError(PlowLoad::Waiting,
+            "Várom a province_snowPlow erőforrást — a szerverre lépés után indul el");
+    else
+        SetPlowLoadError(PlowLoad::Error, "Nem töltődött be: " + error);
+    static std::string previousError;
+    if(error != previousError)
+    {
+        previousError = error;
+        Log::Write(L"[plow] runtime injection pending: " + WideAscii(error));
+    }
+}
+
+bool InjectFromInjector(std::string_view resource, std::string_view code,
+    std::uintptr_t& id, std::string& error)
+{
+    const bool plow = resource == PlowResource
+        && code.find("dfPlowUpdate") != std::string_view::npos;
+    if(!plow)
+        return InjectIntoResource(resource, code, id, error);
+    if(!LuaCompiles(resource, code, error))
+        return false;
+    RemovePlowSession();
+    if(!InjectIntoResource(resource, code, id, error))
+    {
+        g_plowState.store(0, std::memory_order_release);
+        return false;
+    }
+    g_plowSession.store(id, std::memory_order_release);
+    g_plowState.store(2, std::memory_order_release);
+    g_plowUserUnloaded.store(false, std::memory_order_release);
+    g_plowStatusError.clear();
+    PlowSetScript(PlowScriptVersion(code), code.size());
+    PlowSetLoad(PlowLoad::Loaded, "Kézzel betöltve a Lua Injectorral: " + LocalClock());
+    Log::Write(L"[plow] loaded from Lua Injector: " + WideAscii(ThreadKey(id)));
+    return true;
+}
+
+void ResetForReconnect(bool immediate = false)
+{
+    if(g_bootstrapState.load(std::memory_order_acquire) != 2)
+        return;
+    void* previous = g_bootstrapLua.load(std::memory_order_acquire);
+    void* owner = g_bootstrapMain.load(std::memory_order_acquire);
+    if(!previous || !owner)
+        return;
+    const DWORD now = GetTickCount();
+    DWORD checked = g_reconnectCheckTick.load(std::memory_order_relaxed);
+    if(!immediate && (now - checked < 1000
+        || !g_reconnectCheckTick.compare_exchange_strong(checked, now,
+            std::memory_order_relaxed)))
+    {
+        return;
+    }
+    if(immediate)
+        g_reconnectCheckTick.store(now, std::memory_order_relaxed);
+    if(LuaStateAlive(previous, owner))
+        return;
+
+    std::uint32_t expected = 2;
+    if(!g_bootstrapState.compare_exchange_strong(expected, 0,
+        std::memory_order_acq_rel, std::memory_order_acquire))
+    {
+        return;
+    }
+    g_bootstrapLua.store(nullptr, std::memory_order_release);
+    g_bootstrapMain.store(nullptr, std::memory_order_release);
+    g_reconnectCheckTick.store(0, std::memory_order_release);
+    g_tramState.store(0, std::memory_order_release);
+    g_tramSession.store(0, std::memory_order_release);
+    g_tramRetryTick.store(0, std::memory_order_release);
+    g_tramUiReadyLogged.store(false, std::memory_order_release);
+    g_jbkState.store(0, std::memory_order_release);
+    g_jbkSession.store(0, std::memory_order_release);
+    g_jbkRetryTick.store(0, std::memory_order_release);
+    g_jbkUiReadyLogged.store(false, std::memory_order_release);
+    g_pilotState.store(0, std::memory_order_release);
+    g_pilotSession.store(0, std::memory_order_release);
+    g_pilotRetryTick.store(0, std::memory_order_release);
+    g_plowState.store(0, std::memory_order_release);
+    g_plowSession.store(0, std::memory_order_release);
+    g_plowRetryTick.store(0, std::memory_order_release);
+    g_plowNext.clear();
+    g_plowStatusError.clear();
+    g_plowAliveTick = 0;
+    g_plowUserUnloaded.store(false, std::memory_order_release);
+    g_alertMonitorSources.store(0, std::memory_order_release);
+    g_sessions.clear();
+    ClearEventCatchers(false);
+    GuiClearLuaThreads();
+    GuiResetTramState();
+    GuiResetJbkState();
+    g_hideCalls.store(false, std::memory_order_release);
+    g_scopeDepth.store(0, std::memory_order_release);
+}
+
+LuaCFunction FindRegisteredLuaFunction(std::uintptr_t getFunction,
+    std::string_view wanted)
+{
+    std::uint8_t mapLoadOpcode{};
+    std::uintptr_t mapAddress{};
+    if(!ReadValue(reinterpret_cast<const void*>(getFunction), 0x1D,
+        mapLoadOpcode) || mapLoadOpcode != 0xB9
+        || !ReadValue(reinterpret_cast<const void*>(getFunction), 0x1E,
+            mapAddress) || mapAddress <= 0xC)
+    {
+        return nullptr;
+    }
+
+    // CLuaCFunctions owns a std::vector<CLuaCFunction*> immediately before the
+    // std::map<lua_CFunction, CLuaCFunction*> at mapAddress. Each descriptor
+    // stores the plain C function at +0 and a std::string name at +4. Reading
+    // the registry map's nodes is not portable: their value already points to
+    // the descriptor, so scanning the descriptor vector is both simpler and
+    // avoids the hash-key bookkeeping.
+    std::uintptr_t begin{};
+    std::uintptr_t end{};
+    if(!ReadValue(reinterpret_cast<const void*>(mapAddress - 0xC), 0, begin)
+        || !ReadValue(reinterpret_cast<const void*>(mapAddress - 0x8), 0, end)
+        || end < begin || (end - begin) % sizeof(void*) != 0)
+    {
+        return nullptr;
+    }
+    const std::uintptr_t count = (end - begin) / sizeof(void*);
+    if(count > 8192)
+        return nullptr;
+    for(std::uintptr_t index = 0; index < count; ++index)
+    {
+        std::uintptr_t descriptor{};
+        if(!ReadValue(reinterpret_cast<const void*>(
+            begin + index * sizeof(void*)), 0, descriptor) || !descriptor)
+        {
+            continue;
+        }
+        LuaCFunction function{};
+        std::string name;
+        if(!ReadValue(reinterpret_cast<const void*>(descriptor), 0, function)
+            || !function
+            || !ReadSString(reinterpret_cast<const void*>(descriptor + 4),
+                name, 96))
+        {
+            continue;
+        }
+        if(name == wanted)
+            return function;
+    }
+    return nullptr;
+}
+
+int __cdecl HookTriggerServerEvent(void* lua)
+{
+    DispatchEventCatchers(lua);
+    SetNetcLuaCallContext(CurrentLuaResource(lua));
+    const int result = g_triggerServerEvent(lua);
+    ClearNetcLuaCallContext();
+    return result;
+}
+
+bool ReadArguments(const void* arguments, LuaArgumentsView& view,
+    std::size_t& count)
+{
+    if(!ReadValue(arguments, 0, view) || view.end < view.begin
+        || view.capacity < view.end || (view.end - view.begin) % sizeof(void*))
+    {
+        return false;
+    }
+    count = (view.end - view.begin) / sizeof(void*);
+    return count <= 256 && (!count || Readable(
+        reinterpret_cast<const void*>(view.begin), count * sizeof(void*)));
+}
+
+const void* ArgumentAt(const LuaArgumentsView& view, std::size_t index)
+{
+    const void* argument{};
+    if(!ReadValue(reinterpret_cast<const void*>(view.begin),
+        index * sizeof(void*), argument))
+    {
+        return nullptr;
+    }
+    return argument;
+}
+
+bool ArgumentString(const void* argument, std::string& output,
+    std::size_t limit = 512)
+{
+    std::uint32_t length{};
+    std::uint32_t capacity{};
+    if(!ReadValue(argument, 40, length) || !ReadValue(argument, 44, capacity)
+        || length > capacity || length > 1024 * 1024)
+    {
+        return false;
+    }
+    const char* text{};
+    if(capacity <= 15)
+        text = reinterpret_cast<const char*>(argument) + 24;
+    else if(!ReadValue(argument, 24, text))
+        return false;
+    const std::size_t copied = std::min<std::size_t>(length, limit);
+    if(copied && !Readable(text, copied))
+        return false;
+    output.assign(text ? text : "", copied);
+    if(copied != length)
+        output += "...";
+    return true;
+}
+
+std::string FormatArgument(const void* argument, unsigned depth = 0)
+{
+    int type{-1};
+    if(!ReadValue(argument, 0, type))
+        return "<invalid>";
+    switch(type)
+    {
+    case 0:
+        return "nil";
+    case 1:
+    {
+        bool value{};
+        return ReadValue(argument, 8, value)
+            ? (value ? "true" : "false") : "<invalid-bool>";
+    }
+    case 2:
+    case 7:
+    {
+        std::uintptr_t value{};
+        return ReadValue(argument, 48, value)
+            ? (type == 7 ? "userdata(" : "lightuserdata(") + Hex(value) + ")"
+            : "<invalid-userdata>";
+    }
+    case 3:
+    {
+        double value{};
+        if(!ReadValue(argument, 16, value))
+            return "<invalid-number>";
+        char output[64]{};
+        const auto result = std::to_chars(output, output + sizeof(output), value,
+            std::chars_format::general, 12);
+        return result.ec == std::errc{} ? std::string(output, result.ptr)
+            : "<number>";
+    }
+    case 4:
+    case 10:
+    {
+        std::string value;
+        return ArgumentString(argument, value) ? Escape(value) : "<invalid-string>";
+    }
+    case 5:
+    case 9:
+    {
+        const void* table{};
+        if(depth >= 2 || !ReadValue(argument, 52, table))
+            return depth >= 2 ? "{...}" : "<invalid-table>";
+        LuaArgumentsView view{};
+        std::size_t count{};
+        if(!ReadArguments(table, view, count))
+            return "<invalid-table>";
+        std::string output = "{";
+        const std::size_t displayed = std::min<std::size_t>(count, 16);
+        for(std::size_t index = 0; index < displayed; ++index)
+        {
+            if(index)
+                output += ", ";
+            output += FormatArgument(ArgumentAt(view, index), depth + 1);
+        }
+        if(displayed != count)
+            output += ", ...";
+        output += "}";
+        return output;
+    }
+    case 6:
+        return "<function>";
+    case 8:
+        return "<thread>";
+    default:
+        return "<type:" + std::to_string(type) + ">";
+    }
+}
+
+bool NativeEventRow(const char* name, const void* arguments, std::string& row)
+{
+    LuaArgumentsView view{};
+    std::size_t count{};
+    if(!ReadArguments(arguments, view, count) || count < 5)
+        return false;
+
+    std::string file;
+    if(!ArgumentString(ArgumentAt(view, 3), file, 768))
+        file = "?";
+    double line{};
+    if(!ReadValue(ArgumentAt(view, 4), 16, line))
+        line = 0;
+
+    std::string eventName;
+    if(count > 5 && ArgumentString(ArgumentAt(view, 5), eventName)
+        && (eventName == "inventory:getPlayersObjectInfo"
+            || eventName == "radio:onPlayerSyncBoomBox"
+            || eventName == "player:requestStreamData"))
+    {
+        return false;
+    }
+
+    row = "[native ";
+    row += FormatArgument(ArgumentAt(view, 0));
+    row += " | " + file + ":" + std::to_string(static_cast<int>(line)) + "] ";
+    row += name;
+    row += "(args: " + std::to_string(count - 5) + "): ";
+    for(std::size_t index = 5; index < count; ++index)
+    {
+        if(index != 5)
+            row += ", ";
+        row += FormatArgument(ArgumentAt(view, index));
+        if(row.size() > 8192)
+        {
+            row.resize(8192);
+            row += "...";
+            break;
+        }
+    }
+    return true;
+}
+
+bool __stdcall HookCallHook(const char* name, const void* eventHookList,
+    const void* arguments, bool explicitlyAllowed)
+{
+    // CallHook returns true = do not skip native.
+    if(HiddenActive())
+        return true;
+
+    try
+    {
+        if(name && MonitorName(name))
+        {
+            std::string row;
+            if(NativeEventRow(name, arguments, row))
+            {
+                GuiAppendEvent(row);
+                if(!g_eventLogged.exchange(true))
+                    Log::Write(L"[lua-bridge] first native CallHook event reached");
+            }
+        }
+    }
+    catch(...)
+    {
+        Log::Write(L"[lua-bridge] native CallHook formatter failed");
+    }
+    return g_callHook(name, eventHookList, arguments, explicitlyAllowed);
+}
+
+bool __fastcall HookOnPreFunction(void* self, void*, LuaCFunction nativeFunction,
+    void* lua, bool nativeAllowed)
+{
+    // client.dll 0x1015D145 -> OnPreFunction 0x10225890(fn, lua_State*); false cancels luaD_precall.
+    return g_onPreFunction(self, nativeFunction, lua, nativeAllowed);
+}
+
+bool InstallHook(void* target, void* detour, void** original)
+{
+    const MH_STATUS created = MH_CreateHook(target, detour, original);
+    if(created != MH_OK)
+        return false;
+    if(MH_EnableHook(target) == MH_OK)
+        return true;
+    MH_RemoveHook(target);
+    *original = nullptr;
+    return false;
+}
+
+bool ReadHookPatch(void* target, std::array<unsigned char, 8>& patch)
+{
+    if(!target)
+        return false;
+    MEMORY_BASIC_INFORMATION info{};
+    if(!VirtualQuery(target, &info, sizeof(info)) || info.State != MEM_COMMIT
+        || (info.Protect & (PAGE_GUARD | PAGE_NOACCESS)))
+        return false;
+    __try
+    {
+        std::memcpy(patch.data(), target, patch.size());
+        return true;
+    }
+    __except(EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
+std::array<void*, 3> HookTargets()
+{
+    return {g_callHookTarget, g_onPreFunctionTarget, g_triggerServerEventTarget};
+}
+
+void CaptureHookPatches()
+{
+    const auto targets = HookTargets();
+    for(std::size_t index = 0; index < targets.size(); ++index)
+        g_hookPatchValid[index] = ReadHookPatch(targets[index], g_hookPatches[index]);
+}
+
+bool RepairHooks()
+{
+    const auto targets = HookTargets();
+    for(std::size_t index = 0; index < targets.size(); ++index)
+    {
+        std::array<unsigned char, 8> current{};
+        if(g_hookPatchValid[index] && ReadHookPatch(targets[index], current)
+            && current == g_hookPatches[index])
+        {
+            continue;
+        }
+        const MH_STATUS disabled = MH_DisableHook(targets[index]);
+        if(disabled != MH_OK && disabled != MH_ERROR_DISABLED)
+            return false;
+        const MH_STATUS enabled = MH_EnableHook(targets[index]);
+        if(enabled != MH_OK && enabled != MH_ERROR_ENABLED)
+            return false;
+        if(!ReadHookPatch(targets[index], g_hookPatches[index]))
+            return false;
+        g_hookPatchValid[index] = true;
+        Log::Write(L"[lua-bridge] restored overwritten signature hook");
+    }
+    return true;
+}
+
+void RemoveHooks()
+{
+    ClearEventCatchers(true);
+    if(g_onPreFunctionTarget)
+    {
+        MH_DisableHook(g_onPreFunctionTarget);
+        MH_RemoveHook(g_onPreFunctionTarget);
+    }
+    if(g_callHookTarget)
+    {
+        MH_DisableHook(g_callHookTarget);
+        MH_RemoveHook(g_callHookTarget);
+    }
+    if(g_triggerServerEventTarget)
+    {
+        MH_DisableHook(g_triggerServerEventTarget);
+        MH_RemoveHook(g_triggerServerEventTarget);
+    }
+    g_onPreFunctionTarget = nullptr;
+    g_callHookTarget = nullptr;
+    g_triggerServerEventTarget = nullptr;
+    g_clientModule = nullptr;
+    g_hookPatches = {};
+    g_hookPatchValid = {};
+    g_luaNewThread = nullptr;
+    g_onPreFunction = nullptr;
+    g_callHook = nullptr;
+    g_triggerServerEvent = nullptr;
+    g_triggerEvent = nullptr;
+    g_addEvent = nullptr;
+    g_addEventHandler = nullptr;
+    g_removeEventHandler = nullptr;
+    g_getVirtualMachine = nullptr;
+    g_hardenedLuaManager = false;
+    g_luaManagerSlot = nullptr;
+    g_clientGameSlot = nullptr;
+    g_debugHookManagerOffset = 0;
+    g_addDebugHook = nullptr;
+    g_removeDebugHook = nullptr;
+    g_luaMToRef = nullptr;
+    g_luaFunctionRefDtor = nullptr;
+    ClearNetcLuaCallContext();
+    g_hideCalls.store(false, std::memory_order_release);
+    g_scopeDepth.store(0, std::memory_order_release);
+    g_monitorReady.store(false, std::memory_order_release);
+    g_bootstrapState.store(0, std::memory_order_release);
+    g_bootstrapLua.store(nullptr, std::memory_order_release);
+    g_bootstrapMain.store(nullptr, std::memory_order_release);
+    g_bootstrapError.clear();
+    g_reconnectCheckTick.store(0, std::memory_order_release);
+    g_runtimePulseTick.store(0, std::memory_order_release);
+    g_tramState.store(0, std::memory_order_release);
+    g_tramSession.store(0, std::memory_order_release);
+    g_tramRetryTick.store(0, std::memory_order_release);
+    g_tramUiReadyLogged.store(false, std::memory_order_release);
+    g_jbkState.store(0, std::memory_order_release);
+    g_jbkSession.store(0, std::memory_order_release);
+    g_jbkRetryTick.store(0, std::memory_order_release);
+    g_jbkUiReadyLogged.store(false, std::memory_order_release);
+    g_pilotState.store(0, std::memory_order_release);
+    g_pilotSession.store(0, std::memory_order_release);
+    g_pilotRetryTick.store(0, std::memory_order_release);
+    g_plowState.store(0, std::memory_order_release);
+    g_plowSession.store(0, std::memory_order_release);
+    g_plowRetryTick.store(0, std::memory_order_release);
+    g_plowNext.clear();
+    g_plowStatusError.clear();
+    g_plowAliveTick = 0;
+    g_plowUserUnloaded.store(false, std::memory_order_release);
+    g_alertMonitorSources.store(0, std::memory_order_release);
+    g_sessions.clear();
+    GuiClearLuaThreads();
+    GuiResetTramState();
+    GuiResetJbkState();
+    g_ready.store(false, std::memory_order_release);
+}
+
+std::uintptr_t Find(const SignatureScanner& scanner, std::string_view pattern,
+    const wchar_t* name)
+{
+    const std::uintptr_t address = scanner.Find(pattern);
+    Log::Scan(name, address ? L"found" : L"not_found", address);
+    return address;
+}
+
+template <std::size_t Count>
+std::uintptr_t FindAny(const SignatureScanner& scanner,
+    const std::string_view (&patterns)[Count], const wchar_t* name)
+{
+    for(const std::string_view pattern : patterns)
+    {
+        const std::uintptr_t address = scanner.Find(pattern);
+        if(address)
+        {
+            Log::Scan(name, L"found", address);
+            return address;
+        }
+    }
+    Log::Scan(name, L"not_found", 0);
+    return 0;
+}
+}
+
+bool LuaAlertMonitorEnabled()
+{
+    return g_alertMonitorSources.load(std::memory_order_acquire) != 0;
+}
+
+void PulseLuaBridge()
+{
+    const DWORD now = GetTickCount();
+    static std::atomic<DWORD> lastDiagnostic{};
+    const auto diagnose = [&](const wchar_t* reason)
+    {
+        DWORD previous = lastDiagnostic.load(std::memory_order_relaxed);
+        if(now - previous < 5000 || !lastDiagnostic.compare_exchange_strong(previous,
+            now, std::memory_order_relaxed))
+        {
+            return;
+        }
+        Log::Write(std::wstring(L"[lua-bridge] pulse skipped: ") + reason
+            + L" state=" + std::to_wstring(g_bootstrapState.load(std::memory_order_acquire))
+            + L" attemptThread=" + std::to_wstring(GetCurrentThreadId()));
+    };
+
+    std::unique_lock lock(g_installMutex, std::try_to_lock);
+    if(!lock.owns_lock())
+    {
+        diagnose(L"install lock busy");
+        return;
+    }
+    if(!g_ready.load(std::memory_order_acquire))
+    {
+        diagnose(L"bridge not ready");
+        return;
+    }
+    HWND window = ProcessWindow();
+    DWORD windowThread{};
+    if(window)
+        windowThread = GetWindowThreadProcessId(window, nullptr);
+    if(windowThread && windowThread != GetCurrentThreadId())
+    {
+        diagnose((L"window thread mismatch window=" + std::to_wstring(windowThread)).c_str());
+        return;
+    }
+    DWORD checked = g_runtimePulseTick.load(std::memory_order_relaxed);
+    if(now - checked < 50 || !g_runtimePulseTick.compare_exchange_strong(
+        checked, now, std::memory_order_relaxed))
+    {
+        return;
+    }
+    ResetForReconnect();
+    RunDirectBootstrap();
+    TryStartTramBot();
+    TryStartJbkBot();
+    TryStartPilotBot();
+    TryStartPlowBot();
+}
+
+bool PlayTramAlertSignal()
+{
+    HWND window = ProcessWindow();
+    // FlashWindowEx on a focused fullscreen D3D window stalls the next Present.
+    if(window && GetForegroundWindow() != window)
+    {
+        FLASHWINFO flash{sizeof(flash), window, FLASHW_TRAY, 3, 0};
+        FlashWindowEx(&flash);
+    }
+    MEMORY_BASIC_INFORMATION memory{};
+    if(!VirtualQuery(reinterpret_cast<const void*>(&PlayTramAlertSignal),
+        &memory, sizeof(memory)) || !memory.AllocationBase)
+    {
+        Log::Write(L"[alert] VirtualQuery failed: " + std::to_wstring(GetLastError()));
+        return false;
+    }
+    const HMODULE module = static_cast<HMODULE>(memory.AllocationBase);
+    SetLastError(ERROR_SUCCESS);
+    HRSRC resource = FindResourceW(module, MAKEINTRESOURCEW(IDR_DARK_FLAME_ALERT), L"WAVE");
+    if(!resource)
+    {
+        Log::Write(L"[alert] embedded WAV resource not found: "
+            + std::to_wstring(GetLastError()));
+        return false;
+    }
+    const DWORD size = SizeofResource(module, resource);
+    HGLOBAL loaded = LoadResource(module, resource);
+    const void* wave = loaded ? LockResource(loaded) : nullptr;
+    if(!size || !wave)
+    {
+        Log::Write(L"[alert] embedded WAV resource could not be loaded: "
+            + std::to_wstring(GetLastError()));
+        return false;
+    }
+    // winmm opens the audio device on first use: never play on the render thread.
+    try
+    {
+        std::thread([wave]
+        {
+            SetLastError(ERROR_SUCCESS);
+            const bool played = PlaySoundA(static_cast<LPCSTR>(wave), nullptr,
+                SND_MEMORY | SND_SYNC | SND_NODEFAULT) != FALSE;
+            Log::Write(played ? L"[alert] embedded WAV playback finished"
+                : L"[alert] PlaySound failed: " + std::to_wstring(GetLastError()));
+        }).detach();
+    }
+    catch(const std::system_error& error)
+    {
+        Log::Write(L"[alert] playback thread failed: " + std::to_wstring(error.code().value()));
+        return false;
+    }
+    Log::Write(L"[alert] embedded WAV playback queued");
+    return true;
+}
+
+bool InstallLuaBridge(HMODULE client, std::wstring_view loaderDirectory)
+{
+    if(!client)
+        return false;
+    std::scoped_lock lock(g_installMutex);
+    if(g_ready.load(std::memory_order_relaxed))
+    {
+        if(g_clientModule == client)
+            return RepairHooks();
+        RemoveHooks();
+    }
+
+    BuildBootstrapPayload(loaderDirectory);
+    if(!DarkFlameLuaParserSelfTest())
+    {
+        PlowSetLoad(PlowLoad::Error, "A Lua híd nincs telepítve: a beépített Lua öntesztje nem sikerült");
+        Log::Write(L"[lua-bridge] private embedded runtime self-test failed");
+        return false;
+    }
+    Log::Write(L"[lua-bridge] private embedded runtime self-test passed");
+
+    const SignatureScanner scanner(client);
+    const std::uintptr_t callHook = Find(scanner, CallHookPattern,
+        L"CDebugHookManager::CallHook");
+    const std::uintptr_t newThread = Find(scanner, LuaNewThreadPattern,
+        L"lua_newthread");
+    const std::uintptr_t getLuaFunction = Find(scanner,
+        LuaFunctionRegistryPattern,
+        L"CLuaCFunctions::GetFunction");
+    const std::uintptr_t getVirtualMachine = FindAny(scanner,
+        GetVirtualMachinePatterns, L"CLuaManager::GetVirtualMachine");
+    const std::uintptr_t luaManagerLoad = Find(scanner, LuaManagerLoadPattern,
+        L"CLuaDefs::m_pLuaManager load");
+    const std::uintptr_t addDebugHook = FindAny(scanner, AddDebugHookPatterns,
+        L"CDebugHookManager::AddDebugHook");
+    const std::uintptr_t removeDebugHook = FindAny(scanner,
+        RemoveDebugHookPatterns, L"CDebugHookManager::RemoveDebugHook");
+    const std::uintptr_t luaMToRef = Find(scanner, LuaMToRefPattern,
+        L"luaM_toref");
+    const std::uintptr_t luaFunctionRefDtor = Find(scanner,
+        LuaFunctionRefDtorPattern, L"CLuaFunctionRef::~CLuaFunctionRef");
+    const std::uintptr_t clientGameAccess = FindAny(scanner,
+        ClientGameDebugHookAccessPatterns, L"g_pClientGame debug-hook access");
+    // Access site calls OnPreFunction(nativeFunction, lua, true) via rel32; not IsNameAllowed.
+    std::uintptr_t onPreFunction = 0;
+    if(clientGameAccess)
+    {
+        const std::int32_t relative = *reinterpret_cast<const std::int32_t*>(
+            clientGameAccess + OnPreFunctionCallOffset);
+        onPreFunction = clientGameAccess + OnPreFunctionCallOffset + 4
+            + static_cast<std::uintptr_t>(relative);
+    }
+    Log::Scan(L"CDebugHookManager::OnPreFunction",
+        onPreFunction ? L"derived from access site" : L"not_found", onPreFunction);
+    if(!onPreFunction || !callHook || !newThread
+        || !getLuaFunction || !getVirtualMachine || !luaManagerLoad
+        || !addDebugHook || !removeDebugHook || !luaMToRef
+        || !luaFunctionRefDtor
+        || !clientGameAccess)
+    {
+        PlowSetLoad(PlowLoad::Error, "A Lua híd nincs telepítve: a játékban nem találhatók a szignatúrák "
+            "(melyek — a DarkFlame.log [scan] … not_found sorai). A bot betöltődik, amikor a híd működik");
+        Log::Write(L"[lua-bridge] signature resolution failed");
+        return false;
+    }
+
+    g_luaNewThread = reinterpret_cast<LuaNewThreadFn>(newThread);
+    g_addDebugHook = reinterpret_cast<AddDebugHookFn>(addDebugHook);
+    g_removeDebugHook = reinterpret_cast<RemoveDebugHookFn>(removeDebugHook);
+    g_luaMToRef = reinterpret_cast<LuaMToRefFn>(luaMToRef);
+    g_luaFunctionRefDtor = reinterpret_cast<LuaFunctionRefDtorFn>(
+        luaFunctionRefDtor);
+    g_getVirtualMachine = reinterpret_cast<GetVirtualMachineFn>(getVirtualMachine);
+    g_hardenedLuaManager =
+        *reinterpret_cast<const unsigned char*>(getVirtualMachine) == 0x55
+        && *reinterpret_cast<const unsigned char*>(
+            getVirtualMachine + GetVirtualMachineKeyCallOffset) == 0xE8;
+    Log::Scan(L"CLuaManager hardened VM layout",
+        g_hardenedLuaManager ? L"detected from GetVirtualMachine"
+            : L"legacy list layout",
+        g_hardenedLuaManager ? getVirtualMachine : 0);
+    g_luaManagerSlot = *reinterpret_cast<void***>(luaManagerLoad + 2);
+    g_clientGameSlot = *reinterpret_cast<void***>(
+        clientGameAccess + ClientGameSlotOffset);
+    g_debugHookManagerOffset = *reinterpret_cast<const std::uint32_t*>(
+        clientGameAccess + DebugHookManagerFieldOffset);
+    if(!g_clientGameSlot || !g_debugHookManagerOffset
+        || g_debugHookManagerOffset > 0x10000)
+    {
+        PlowSetLoad(PlowLoad::Error, "A Lua híd nincs telepítve: a debug-hook manager elérése nem deríthető ki");
+        Log::Write(L"[lua-bridge] debug-hook manager access decode failed");
+        return false;
+    }
+    g_onPreFunctionTarget = reinterpret_cast<void*>(onPreFunction);
+    g_callHookTarget = reinterpret_cast<void*>(callHook);
+    for(DWORD waited = 0; waited <= 5000
+        && (!g_triggerServerEventTarget || !g_triggerEvent || !g_addEvent
+            || !g_addEventHandler || !g_removeEventHandler);
+        waited += 10)
+    {
+        if(!g_triggerServerEventTarget)
+        {
+            g_triggerServerEventTarget = reinterpret_cast<void*>(
+                FindRegisteredLuaFunction(getLuaFunction, "triggerServerEvent"));
+        }
+        if(!g_addEvent)
+            g_addEvent = FindRegisteredLuaFunction(getLuaFunction, "addEvent");
+        if(!g_addEventHandler)
+        {
+            g_addEventHandler = FindRegisteredLuaFunction(getLuaFunction,
+                "addEventHandler");
+        }
+        if(!g_triggerEvent)
+            g_triggerEvent = FindRegisteredLuaFunction(getLuaFunction,
+                "triggerEvent");
+        if(!g_removeEventHandler)
+        {
+            g_removeEventHandler = FindRegisteredLuaFunction(getLuaFunction,
+                "removeEventHandler");
+        }
+        if((!g_triggerServerEventTarget || !g_triggerEvent || !g_addEvent
+            || !g_addEventHandler || !g_removeEventHandler)
+            && waited != 5000)
+        {
+            Sleep(10);
+        }
+    }
+    Log::Scan(L"CLuaFunctionDefs::TriggerServerEvent",
+        g_triggerServerEventTarget ? L"resolved" : L"not_found",
+        reinterpret_cast<std::uintptr_t>(g_triggerServerEventTarget));
+    Log::Scan(L"CLuaFunctionDefs::AddEvent",
+        g_addEvent ? L"resolved" : L"not_found",
+        reinterpret_cast<std::uintptr_t>(g_addEvent));
+    Log::Scan(L"CLuaFunctionDefs::AddEventHandler",
+        g_addEventHandler ? L"resolved" : L"not_found",
+        reinterpret_cast<std::uintptr_t>(g_addEventHandler));
+    Log::Scan(L"CLuaFunctionDefs::TriggerEvent",
+        g_triggerEvent ? L"resolved" : L"not_found",
+        reinterpret_cast<std::uintptr_t>(g_triggerEvent));
+    Log::Scan(L"CLuaFunctionDefs::RemoveEventHandler",
+        g_removeEventHandler ? L"resolved" : L"not_found",
+        reinterpret_cast<std::uintptr_t>(g_removeEventHandler));
+    if(!g_triggerServerEventTarget || !g_triggerEvent || !g_addEvent
+        || !g_addEventHandler || !g_removeEventHandler)
+    {
+        PlowSetLoad(PlowLoad::Error, "A Lua híd nincs telepítve: nem találhatók az MTA függvényei (triggerServerEvent stb.)");
+        Log::Write(L"[lua-bridge] direct alias registry lookup failed");
+        return false;
+    }
+
+    InitializeNetcClientApi(client);
+
+    if(!InstallHook(g_callHookTarget, reinterpret_cast<void*>(&HookCallHook),
+        reinterpret_cast<void**>(&g_callHook))
+        || !InstallHook(g_onPreFunctionTarget,
+        reinterpret_cast<void*>(&HookOnPreFunction),
+        reinterpret_cast<void**>(&g_onPreFunction))
+        || !InstallHook(g_triggerServerEventTarget,
+            reinterpret_cast<void*>(&HookTriggerServerEvent),
+            reinterpret_cast<void**>(&g_triggerServerEvent)))
+    {
+        RemoveHooks();
+        PlowSetLoad(PlowLoad::Error, "A Lua híd nincs telepítve: a hookok nem települtek");
+        Log::Write(L"[lua-bridge] hook installation failed");
+        return false;
+    }
+
+    g_monitorReady.store(true, std::memory_order_release);
+    g_bootstrapState.store(0, std::memory_order_release);
+    g_bootstrapLua.store(nullptr, std::memory_order_release);
+    g_bootstrapMain.store(nullptr, std::memory_order_release);
+    g_bootstrapError.clear();
+    g_reconnectCheckTick.store(0, std::memory_order_release);
+    g_runtimePulseTick.store(0, std::memory_order_release);
+    g_tramState.store(0, std::memory_order_release);
+    g_tramSession.store(0, std::memory_order_release);
+    g_tramRetryTick.store(0, std::memory_order_release);
+    g_tramUiReadyLogged.store(false, std::memory_order_release);
+    g_jbkState.store(0, std::memory_order_release);
+    g_jbkSession.store(0, std::memory_order_release);
+    g_jbkRetryTick.store(0, std::memory_order_release);
+    g_jbkUiReadyLogged.store(false, std::memory_order_release);
+    g_pilotState.store(0, std::memory_order_release);
+    g_pilotSession.store(0, std::memory_order_release);
+    g_pilotRetryTick.store(0, std::memory_order_release);
+    g_plowState.store(0, std::memory_order_release);
+    g_plowSession.store(0, std::memory_order_release);
+    g_plowRetryTick.store(0, std::memory_order_release);
+    g_plowNext.clear();
+    g_plowStatusError.clear();
+    g_plowAliveTick = 0;
+    g_plowUserUnloaded.store(false, std::memory_order_release);
+    g_alertMonitorSources.store(0, std::memory_order_release);
+    GuiResetTramState();
+    GuiResetJbkState();
+    g_clientModule = client;
+    CaptureHookPatches();
+    g_ready.store(true, std::memory_order_release);
+    PlowSetLoad(PlowLoad::Waiting, "A Lua híd telepítve, indítom");
+    Log::Write(L"[lua-bridge] targeted packet context, native monitor, and Lua bridge ready");
+    return true;
+}
+
+bool RepairLuaBridgeHooks(HMODULE client)
+{
+    std::scoped_lock lock(g_installMutex);
+    return client && g_ready.load(std::memory_order_acquire)
+        && g_clientModule == client && RepairHooks();
+}
+
+void ResetLuaBridgeHooks(HMODULE client)
+{
+    std::scoped_lock lock(g_installMutex);
+    if(g_ready.load(std::memory_order_acquire)
+        && (!client || client == g_clientModule))
+    {
+        RemoveHooks();
+    }
+}
